@@ -77,13 +77,21 @@ bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept {
     }
     const cache::records::Domains domains =
         runtime::persistence::occupied_domains(persistenceState, counts);
-    bool detailsReplaced = false;
-    if (domains.itemDetails.empty()) {
-        items::details::clear();
-        detailsReplaced = true;
-    } else {
-        detailsReplaced = items::details::replace(domains.itemDetails);
-    }
+
+    // Do not restore the two derived equipment domains whose contents depend on Sunrise's own
+    // extraction/resolution logic. The cache identity names the game executable and configured
+    // equipment, but not the Sunrise DLL revision that produced the rows.
+    //
+    // In particular, the live item-detail definition now carries generic + Titan + Hunter +
+    // Warlock art-arrangement indices, while cache format 23 stores only the old single arrangement
+    // index. Restoring that lossy row makes ornaments lose their class-qualified art on a cached
+    // boot and can preserve stale shader/material data across Sunrise source revisions. Ability
+    // buckets are likewise derived from the current subclass resolver. Socket compatibility already
+    // requires a package-table pass every process, so rebuilding both domains alongside it is the
+    // safe path with very little additional work. Keep both readiness markers unpublished here;
+    // package_item_rows will repopulate them from the installed packages.
+    items::details::clear();
+
     const constants::InvestmentConstants cachedConstants{
         domains.constants.extracted != 0,
         domains.constants.lightStatRow,
@@ -95,8 +103,7 @@ bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept {
         || !socket_entry_lists::replace(domains.socketEntryLists)
         // The per-entry tables are what the subclass selection reads. Without them a cache hit
         // makes the lists ready, the package build skips itself, and no ability is picked.
-        || !socket_entry_lists::replace_entry_tables(domains.socketEntryTables) || !detailsReplaced
-        || !abilities::replace(domains.abilityBuckets)
+        || !socket_entry_lists::replace_entry_tables(domains.socketEntryTables)
         || !progressions::replace(domains.progressions)
         // The layouts are what activity message 1 reads. Without them a cache hit makes the
         // other domains ready, the package build skips itself, and every destination falls back.
@@ -111,9 +118,10 @@ bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept {
         ReleaseSRWLockExclusive(&persistenceState.lock);
         return false;
     }
-    runtime::details::publish();
+    // Intentionally do not publish runtime::details or runtime::ability_buckets here. The package
+    // pass owns their fresh rebuild so equipment visuals and subclass resolution always match the
+    // currently running Sunrise code.
     runtime::named::publish();
-    runtime::ability_buckets::publish();
     runtime::spawn_catalog::publish();
     runtime::name_catalog::publish();
     persistenceState.persisted = true;
