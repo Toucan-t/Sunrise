@@ -3,11 +3,15 @@
 #include <algorithm>
 #include <cstring>
 
+#include "../../../../state/build_data/runtime.h"
 #include "abi.h"
 #include "layout.h"
 
 namespace sunrise::middleware::datagen::family4::instance {
 namespace {
+
+/** Retail collection item whose four ordinary sockets drive the stock emote wheel. */
+constexpr std::uint32_t kEmoteCollectionHash = 3183180185U;
 
 /**
  * Checks the installed table bounds for one item or plug definition index.
@@ -146,10 +150,31 @@ bool encode(const ResolvedInstance& input, std::span<std::byte> output) noexcept
         // well as this instance's lanes, and skips whichever source its mask leaves unset.
         object.ordinarySockets.activeMask = layout::kAllSocketBits;
         object.ordinarySockets.definitionUnlockMask = layout::kAllSocketBits;
+
+        // The stock four-emote collection is the one measured ordinary-socket item that needs its
+        // resolved plug hashes repeated in the two auxiliary lanes for the Configure/wheel UI.
+        // Keep every other item on the proven safe sentinel: globally filling these lanes was the
+        // regression that made weapon perks appear active simultaneously.
+        bool emoteCollection = false;
+        state::build_data::items::Definition baseDefinition{};
+        if (state::build_data::find_item_definition_index(input.baseDefinitionIndex,
+                                                          baseDefinition)) {
+            emoteCollection = baseDefinition.definitionHash == kEmoteCollectionHash;
+        }
+
         for (std::size_t index = 0; index < input.ordinarySockets.plugs.size(); ++index) {
             const std::optional<std::uint16_t>& plug = input.ordinarySockets.plugs[index];
-            if (plug.has_value()) {
-                object.ordinarySockets.sockets[index].plugDefinitionIndex = *plug;
+            if (!plug.has_value()) {
+                continue;
+            }
+            object.ordinarySockets.sockets[index].plugDefinitionIndex = *plug;
+            if (!emoteCollection) {
+                continue;
+            }
+            state::build_data::items::Definition plugDefinition{};
+            if (state::build_data::find_item_definition_index(*plug, plugDefinition)) {
+                object.ordinarySockets.sockets[index].auxiliaryHashes.fill(
+                    plugDefinition.definitionHash);
             }
         }
     }

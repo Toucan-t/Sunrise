@@ -14,6 +14,14 @@ namespace {
 
 namespace domain = state::build_data::items::details;
 
+/** Retail collection item that owns the stock four-slot emote wheel. */
+constexpr std::uint32_t kEmoteCollectionHash = 3183180185U;
+/** The Emotes collection item omits a native slot mapping; retail still places it in emote slot 14. */
+constexpr std::int8_t kEmoteCollectionNativeSlot = 14;
+/** Known-good initial wheel entries used when Sunrise creates the collection item. */
+constexpr std::array<std::uint32_t, 4> kEmoteCollectionDefaultPlugs{
+    3134905452U, 4049365947U, 1046955906U, 181754010U};
+
 /** Equipment slot for each equippable inventory bucket. */
 constexpr std::array<std::pair<std::uint8_t, std::int8_t>, 16> kEquipmentSlotOfBucket{{
     {16, 0},
@@ -53,7 +61,13 @@ constexpr std::array<std::pair<std::uint8_t, std::int8_t>, 16> kEquipmentSlotOfB
     detail.maxStackSize = row.maxStackSize;
     detail.instancedDefinitionState = row.instanced ? domain::InstancedDefinitionState::instanced
                                                     : domain::InstancedDefinitionState::stackable;
-    detail.equipmentSlot = equipment_slot(row.bucketId);
+    // Retail's "Emotes" collection item is the exception to the normal bucket/slot mapping: its
+    // content carries no equipment-slot mapping even though the client equips it in the ordinary
+    // emote slot. Normalize that omission here so every downstream Sunrise consumer sees the same
+    // native slot instead of needing separate loadout/light/inventory special cases.
+    detail.equipmentSlot = row.definitionHash == kEmoteCollectionHash
+                               ? std::optional<std::int8_t>{kEmoteCollectionNativeSlot}
+                               : equipment_slot(row.bucketId);
     detail.ordinarySocketState =
         row.hasSockets ? domain::OrdinarySocketState::present : domain::OrdinarySocketState::absent;
     detail.ordinarySocketCount = row.socketCount;
@@ -140,6 +154,16 @@ bool collect_authored_hashes(AuthoredHashes& output) noexcept {
 
     if (!append_account(configured) || !append_account(active)) {
         return false;
+    }
+
+    // The stock wheel item is injected after the item domains are usable. Prefetch its base detail
+    // and seed plugs now so that first injection can resolve as a normal resident item immediately.
+    if (output.count + 1U + kEmoteCollectionDefaultPlugs.size() > output.values.size()) {
+        return false;
+    }
+    output.values[output.count++] = kEmoteCollectionHash;
+    for (const std::uint32_t plugHash : kEmoteCollectionDefaultPlugs) {
+        output.values[output.count++] = plugHash;
     }
 
     // Subclasses are the one intentionally tiny catalogue prefetch. Ability buckets are built at

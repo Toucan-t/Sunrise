@@ -2,13 +2,12 @@
 
 #include <array>
 #include <cstdio>
-#include <optional>
+#include <limits>
 #include <string_view>
 
 #include "../../../core/logging/log.h"
 #include "../../../core/ui/busy/busy.h"
 #include "../../../middleware/content/packages/reader/reader.h"
-#include "../../../state/account/characters/character_store.h"
 #include "../../../state/build_data/runtime.h"
 #include "../../../state/runtime/runtime.h"
 #include "../../../state/runtime/storage/internal.h"
@@ -24,50 +23,26 @@ SRWLOCK g_refreshLock{SRWLOCK_INIT};
 
 /** One line reports the freeze, so a run that could not hold the game is visible. */
 constexpr std::size_t kLineLimit = 96;
-/** Legacy retail-collection item injected by the temporary emote-wheel experiment. */
-constexpr std::uint32_t kLegacyEmoteCollectionHash = 3183180185U;
-/** Semantic equipment slot occupied by the normal single equipped emote. */
+/** Retail collection item that owns the stock four-slot emote wheel. */
+constexpr std::uint32_t kEmoteCollectionHash = 3183180185U;
+/** Initial wheel entries used by the retail-compatible collection item. */
+constexpr std::array<std::uint32_t, 4> kEmoteCollectionDefaultPlugs{
+    3134905452U, 4049365947U, 1046955906U, 181754010U};
+/** Semantic Sunrise slot occupied by the retail Emotes collection item. */
 constexpr std::size_t kEmoteSlot =
     static_cast<std::size_t>(state::account::inventory::EquipmentSlot::emote);
 
 /**
- * Removes the persisted temporary emote-wheel item without discarding the user's character store.
- * The experiment replaced the old emote in-place and could subsequently be checkpointed into
- * characters.dat. Once the experiment is removed, that collection item has no ordinary equipment
- * mapping and blocks account-item rehydration forever. Restore the class factory emote while
- * retaining the persisted instance identity and mutation serial, then checkpoint the corrected
- * runtime state so later boots no longer need the migration.
+ * Ensures every runtime character uses the retail four-socket Emotes collection item.
+ * The build-data pass prefetches its base definition and seed plugs before this runs. Keeping the
+ * mutation here avoids changing the persistent character format just to bootstrap a runtime-owned
+ * client feature; a later successful character checkpoint naturally retains subsequent socket
+ * edits made through the ordinary plug transaction.
  */
-[[nodiscard]] bool repair_legacy_emote_collection() noexcept {
-    namespace characters = state::account::characters;
+[[nodiscard]] bool ensure_emote_collection() noexcept {
     namespace inventory = state::account::inventory;
     namespace storage = state::runtime::storage;
 
-    state::CharacterState titanTemplate{};
-    state::CharacterState hunterTemplate{};
-    state::CharacterState warlockTemplate{};
-    const bool haveTitan =
-        characters::template_for_class(state::CharacterClass::titan, titanTemplate);
-    const bool haveHunter =
-        characters::template_for_class(state::CharacterClass::hunter, hunterTemplate);
-    const bool haveWarlock =
-        characters::template_for_class(state::CharacterClass::warlock, warlockTemplate);
-
-    const auto template_for_class = [&](state::CharacterClass characterClass) noexcept
-        -> const state::CharacterState* {
-        switch (characterClass) {
-        case state::CharacterClass::titan:
-            return haveTitan ? &titanTemplate : nullptr;
-        case state::CharacterClass::hunter:
-            return haveHunter ? &hunterTemplate : nullptr;
-        case state::CharacterClass::warlock:
-            return haveWarlock ? &warlockTemplate : nullptr;
-        default:
-            return nullptr;
-        }
-    };
-
-    bool changed = false;
     AcquireSRWLockExclusive(&storage::g_stateLock);
     state::AccountState candidate = storage::g_state.account;
     if (!state::account::valid(candidate)) {
@@ -75,30 +50,51 @@ constexpr std::size_t kEmoteSlot =
         return false;
     }
 
+    std::uint64_t greatestInstance = 0;
+    for (std::size_t characterIndex = 0; characterIndex < candidate.characterCount;
+         ++characterIndex) {
+        const state::CharacterState& character = candidate.characters[characterIndex];
+        for (const auto& item : character.equipment.slots) {
+            if (item.has_value() && item->instanceSoid > greatestInstance) {
+                greatestInstance = item->instanceSoid;
+            }
+        }
+        for (std::size_t itemIndex = 0; itemIndex < character.inventory.count; ++itemIndex) {
+            if (character.inventory.values[itemIndex].instanceSoid > greatestInstance) {
+                greatestInstance = character.inventory.values[itemIndex].instanceSoid;
+            }
+        }
+    }
+
+    bool changed = false;
+    constexpr std::uint32_t kMaximumMutationSerial =
+        static_cast<std::uint32_t>((std::numeric_limits<std::int32_t>::max)());
     for (std::size_t characterIndex = 0; characterIndex < candidate.characterCount;
          ++characterIndex) {
         state::CharacterState& character = candidate.characters[characterIndex];
-        std::optional<inventory::Item>& slot = character.equipment.slots[kEmoteSlot];
-        if (!slot.has_value() || slot->definitionHash != kLegacyEmoteCollectionHash) {
+        auto& slot = character.equipment.slots[kEmoteSlot];
+        if (slot.has_value() && slot->definitionHash == kEmoteCollectionHash) {
             continue;
         }
-
-        const state::CharacterState* factory = template_for_class(character.characterClass);
-        if (factory == nullptr) {
-            ReleaseSRWLockExclusive(&storage::g_stateLock);
-            return false;
-        }
-        const std::optional<inventory::Item>& factoryEmote = factory->equipment.slots[kEmoteSlot];
-        if (!factoryEmote.has_value()
-            || factoryEmote->definitionHash == kLegacyEmoteCollectionHash) {
+        if (greatestInstance == (std::numeric_limits<std::uint64_t>::max)()
+            || character.nextInventorySerial >= kMaximumMutationSerial) {
             ReleaseSRWLockExclusive(&storage::g_stateLock);
             return false;
         }
 
-        inventory::Item replacement = *factoryEmote;
-        replacement.instanceSoid = slot->instanceSoid;
-        replacement.mutationSerial = slot->mutationSerial;
-        slot = replacement;
+        inventory::Item item{};
+        item.instanceSoid = ++greatestInstance;
+        item.definitionHash = kEmoteCollectionHash;
+        item.level = 0;
+        item.quantity = 1;
+        item.mutationSerial = static_cast<std::int32_t>(character.nextInventorySerial++);
+        item.flags = 0;
+        item.sockets.policy = inventory::SocketPolicy::authored;
+        item.sockets.plugCount = kEmoteCollectionDefaultPlugs.size();
+        for (std::size_t lane = 0; lane < kEmoteCollectionDefaultPlugs.size(); ++lane) {
+            item.sockets.plugs[lane] = kEmoteCollectionDefaultPlugs[lane];
+        }
+        slot = item;
         changed = true;
     }
 
@@ -115,14 +111,15 @@ constexpr std::size_t kEmoteSlot =
         return true;
     }
 
+    // Make the bootstrap durable immediately. The previous temporary wheel was allowed to drift
+    // between runtime and characters.dat, which is what made its later rollback capable of
+    // poisoning account-item rehydration. Runtime remains authoritative if the disk write fails.
     const bool checkpointed = state::checkpoint_characters();
     core::log::write(core::log::Channel::state,
                      checkpointed ? core::log::Level::info : core::log::Level::warn,
                      checkpointed
-                         ? "ev=characters stage=legacy_emote_repair result=ok"
-                         : "ev=characters stage=legacy_emote_repair result=runtime_only");
-    // A disk failure must not put the current process back into the boot loop. The repaired runtime
-    // state is already authoritative; at worst the same migration runs again on the next launch.
+                         ? "ev=characters stage=emote_wheel_bootstrap result=ok"
+                         : "ev=characters stage=emote_wheel_bootstrap result=runtime_only");
     return true;
 }
 
@@ -186,13 +183,13 @@ bool refresh() noexcept {
         if (!state::build_data::collectible_definitions_ready()) {
             (void)items::packages::build();
         }
-        const bool accountStateReady = repair_legacy_emote_collection();
-        const bool persisted = accountStateReady && state::build_data::persist();
+        const bool emotesReady = ensure_emote_collection();
+        const bool persisted = emotesReady && state::build_data::persist();
         // characters.dat can contain debug/native-acquired item hashes whose detail rows were
         // merged only for the prior process. Rehydrate those rows before Family 4 is allowed to
         // resolve the persisted owned-item graph.
         const bool accountItemsReady =
-            accountStateReady && items::packages::ensure_account_inventory_item_details();
+            emotesReady && items::packages::ensure_account_inventory_item_details();
         // Nothing reads a package again until the next boot, so the open files and the held
         // tables go back now rather than at process exit.
         middleware::content::packages::reader::release_caches();
@@ -229,12 +226,12 @@ bool refresh() noexcept {
                                   && state::build_data::configured_item_details_ready()
                                   && state::build_data::inventory_bucket_descriptors_ready()
                                   && state::build_data::socket_entry_lists_ready();
-    const bool accountStateReady = itemDomainsReady && repair_legacy_emote_collection();
+    const bool emotesReady = itemDomainsReady && ensure_emote_collection();
     const bool accountItemsReady =
-        accountStateReady && items::packages::ensure_account_inventory_item_details();
+        emotesReady && items::packages::ensure_account_inventory_item_details();
     const bool domainsReady = ready();
     const bool complete =
-        domainsReady && accountStateReady && accountItemsReady && state::build_data::persist();
+        domainsReady && emotesReady && accountItemsReady && state::build_data::persist();
     process::freeze::release(held);
     // The overlay ends with the work, not with the slice, so it spans every retry the pass needs.
     if (complete) {
