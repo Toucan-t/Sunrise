@@ -26,7 +26,7 @@ constexpr std::size_t kSocketTypeOffset = 0;
 constexpr std::size_t kSocketPlugOffset = 2;
 /** Fixed fields end after the instanced predicate. */
 constexpr std::size_t kFixedFieldEnd = kInstancedOffset + 1;
-/** Optional plug category used to expand three native reusable plug families. */
+/** Optional plug category used to expand a small number of reusable plug families. */
 constexpr std::size_t kPlugCategoryOffset = 392;
 /** Embedded reusable-list array descriptor inside one 80-byte ordinary socket entry. */
 constexpr std::size_t kEmbeddedPlugListOffset = 64;
@@ -36,10 +36,9 @@ constexpr std::size_t kRandomizedPlugSetIndexOffset = 32;
 /** One shared plug-set table row is 24 bytes and carries its member descriptor at byte 8. */
 constexpr std::size_t kPlugSetRowStride = 24;
 constexpr std::size_t kPlugSetMemberDescriptorOffset = 8;
-/** Both embedded and shared plug member rows name an item index first and occupy 32 bytes. */
+/** Embedded and shared plug member rows name an item index first and occupy 32 bytes. */
 constexpr std::size_t kPlugMemberStride = 32;
 constexpr std::size_t kPlugMemberIndexOffset = 0;
-/** Native arrays use 16-bit definition indices even though their serialized field is 32-bit. */
 constexpr std::uint64_t kMaximumPlugMemberCount = 65535;
 
 /** @param blob Source bytes. @param offset Field offset. @param value Receives the field. */
@@ -84,7 +83,6 @@ void read_socket_entry_list(std::span<const std::byte> definition, Row& row) noe
  * Reads the optional equipment slot a definition declares.
  * @param definition Whole item definition bytes.
  * @param slot Receives the slot when the block is present and readable.
- * @param raw Receives the unvalidated declared value, or -1 when the block is absent.
  */
 void read_equipment_slot(std::span<const std::byte> definition,
                          std::optional<std::int8_t>& slot,
@@ -263,8 +261,6 @@ bool read_definition(std::span<const std::byte> definition, Row& row) noexcept {
     row = {};
     row.definitionHash = hash;
     row.definitionIndex = index;
-    row.insertionMaterialRequirementSetIndex = kUnavailableMaterialRequirementSetIndex;
-    row.enabledMaterialRequirementSetIndex = kUnavailableMaterialRequirementSetIndex;
     std::fill(std::begin(row.initialPlugs), std::end(row.initialPlugs), kUnavailablePlug);
     std::fill(std::begin(row.socketTypes), std::end(row.socketTypes), kUnavailableSocketType);
     if (definition.size() < kFixedFieldEnd) {
@@ -277,14 +273,7 @@ bool read_definition(std::span<const std::byte> definition, Row& row) noexcept {
         return false;
     }
     row.instanced = instanced != 0;
-    // Short legacy definitions simply do not declare a plug category.
     (void)read(definition, kPlugCategoryOffset, row.plugCategoryHash);
-    (void)read(definition,
-               kInsertionMaterialRequirementSetIndexOffset,
-               row.insertionMaterialRequirementSetIndex);
-    (void)read(definition,
-               kEnabledMaterialRequirementSetIndexOffset,
-               row.enabledMaterialRequirementSetIndex);
     read_stats(definition, row);
     read_appearance(definition, row);
     read_socket_entry_list(definition, row);

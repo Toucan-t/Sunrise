@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <optional>
 
 namespace sunrise::state::account {
 namespace {
@@ -16,36 +17,6 @@ inline constexpr std::size_t kIdentityCapacity =
 [[nodiscard]] bool empty_profile_item(const inventory::ProfileItem& item) noexcept {
     return item.instanceSoid == 0 && item.definitionHash == 0 && item.quantity == 0
            && item.mutationSerial == 0;
-}
-
-/** @return True when one unused dismantle policy row is canonical zero. */
-[[nodiscard]] bool empty_dismantle_reward(const DismantleRewardPolicy& reward) noexcept {
-    return reward.definitionHash == 0 && reward.quantity == 0;
-}
-
-/** Checks filled policy rows, uniqueness, and the zero tail. */
-[[nodiscard]] bool valid_dismantle_rewards(const AccountState& state) noexcept {
-    if (state.dismantleRewardCount > state.dismantleRewards.size()) {
-        return false;
-    }
-    for (std::size_t index = 0; index < state.dismantleRewards.size(); ++index) {
-        const DismantleRewardPolicy& reward = state.dismantleRewards[index];
-        if (index >= state.dismantleRewardCount) {
-            if (!empty_dismantle_reward(reward)) {
-                return false;
-            }
-            continue;
-        }
-        if (reward.definitionHash == inventory::kNoDefinitionHash || reward.quantity <= 0) {
-            return false;
-        }
-        for (std::size_t prior = 0; prior < index; ++prior) {
-            if (state.dismantleRewards[prior].definitionHash == reward.definitionHash) {
-                return false;
-            }
-        }
-    }
-    return true;
 }
 
 /** Adds one nonzero globally unique key to a bounded identity set. */
@@ -63,25 +34,25 @@ inline constexpr std::size_t kIdentityCapacity =
     return true;
 }
 
-/** Checks the complete authored/runtime structure without consulting installed build data. */
-[[nodiscard]] bool valid_impl(const AccountState& state) noexcept {
+} // namespace
+
+/**
+ * Checks bounded ids and whole settings for every nonzero account.
+ * @param state Account State to check.
+ * @return True for empty State, or a whole account with unique ids.
+ */
+bool valid(const AccountState& state) noexcept {
     if (state.profileItemCount > state.profileItems.size()
         || state.characterCount > state.characters.size()) {
         return false;
     }
     if (state.primarySoid == 0) {
-        if (state.profileItemCount != 0 || state.characterCount != 0
-            || state.dismantleRewardCount != 0 || state.settings.configured
-            || state.settings.keyBindings.configured) {
-            return false;
-        }
-        return std::all_of(
-                   state.profileItems.cbegin(), state.profileItems.cend(), empty_profile_item)
-               && std::all_of(state.dismantleRewards.cbegin(),
-                              state.dismantleRewards.cend(),
-                              empty_dismantle_reward);
+        return state.profileItemCount == 0 && state.characterCount == 0 && !state.settings.configured
+               && !state.settings.keyBindings.configured
+               && std::all_of(
+                   state.profileItems.cbegin(), state.profileItems.cend(), empty_profile_item);
     }
-    if (!settings::valid(state.settings) || !valid_dismantle_rewards(state)) {
+    if (!settings::valid(state.settings)) {
         return false;
     }
 
@@ -90,6 +61,7 @@ inline constexpr std::size_t kIdentityCapacity =
     if (!append_identity(identities, identityCount, state.primarySoid)) {
         return false;
     }
+
     for (std::size_t index = 0; index < state.profileItems.size(); ++index) {
         const inventory::ProfileItem& item = state.profileItems[index];
         if (index >= state.profileItemCount) {
@@ -98,8 +70,8 @@ inline constexpr std::size_t kIdentityCapacity =
             }
             continue;
         }
-        if (item.definitionHash == inventory::kNoDefinitionHash || item.quantity <= 0
-            || item.mutationSerial < 0
+        if (item.definitionHash == 0 || item.definitionHash == inventory::kNoDefinitionHash
+            || item.quantity <= 0 || item.mutationSerial < 0
             || (item.instanceSoid != 0
                 && !append_identity(identities, identityCount, item.instanceSoid))) {
             return false;
@@ -135,22 +107,6 @@ inline constexpr std::size_t kIdentityCapacity =
     return true;
 }
 
-} // namespace
-
-/**
- * Checks bounded ids and whole settings for every nonzero account.
- * @param state Account State to check.
- * @return True for empty State, or a whole account with unique ids.
- */
-bool valid(const AccountState& state) noexcept {
-    return valid_impl(state);
-}
-
-/** Checks settings-authored State before runtime-only profile stack identities are seeded. */
-bool valid_authored(const AccountState& state) noexcept {
-    return valid_impl(state);
-}
-
 /**
  * Finds the selected character without storing a second account-level key.
  * @param state Account snapshot read under the lock.
@@ -164,20 +120,6 @@ std::uint64_t selected_character_soid(const AccountState& state) noexcept {
         }
     }
     return 0;
-}
-
-/**
- * Finds the character the family-zero banner pair names.
- * The pair goes out before any pick, so it falls back to the first character.
- * @param state Account snapshot read under the lock.
- * @return The character's nonzero SOID, or zero when the account owns none.
- */
-std::uint64_t banner_character_soid(const AccountState& state) noexcept {
-    const std::uint64_t selected = selected_character_soid(state);
-    if (selected != 0) {
-        return selected;
-    }
-    return state.characterCount == 0 ? 0 : state.characters[0].soid;
 }
 
 } // namespace sunrise::state::account

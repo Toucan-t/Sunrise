@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
-#include <variant>
 
 #include "../../../middleware/bap/family_unsubscription.h"
 #include "../../../middleware/bap/frame.h"
@@ -34,42 +33,6 @@ enum class BodyCodec : std::uint8_t {
     webService,
 };
 
-/** Equipment mutation and the exact QueueZ after-image promised by its response. */
-struct EquipmentSwapTransaction {
-    state::PendingEquipmentSwap pending{};
-    queuez::EquipmentSwap update{};
-};
-
-/** Socket mutation and the exact QueueZ after-image promised by its response. */
-struct SocketPlugTransaction {
-    state::PendingSocketPlug pending{};
-    queuez::SocketPlug update{};
-};
-
-/** Item-state mutation and the exact QueueZ character after-image promised by its response. */
-struct ItemStateTransaction {
-    state::PendingItemState pending{};
-    queuez::EquipmentSwap update{};
-};
-
-/** Character acquisition and its exact QueueZ after-image. */
-struct ItemAcquisitionTransaction {
-    state::PendingItemAcquisition pending{};
-    queuez::ItemAcquisition update{};
-};
-
-/** Profile acquisition and its exact account/resident QueueZ after-image. */
-struct ProfileItemAcquisitionTransaction {
-    state::PendingProfileItemAcquisition pending{};
-    queuez::ProfileItemAcquisition update{};
-};
-
-/** Dismantle mutation and its exact QueueZ after-image. */
-struct ItemDismantleTransaction {
-    state::PendingItemDismantle pending{};
-    queuez::ItemDismantle update{};
-};
-
 /** Optional side effect produced while decoding one authenticated service body. */
 struct ServiceOutcome {
     bool hasSubscription{};
@@ -80,31 +43,40 @@ struct ServiceOutcome {
     queuez::ChangeCharacter changeCharacter{};
     bool hasSelectCharacter{};
     queuez::SelectCharacter selectCharacter{};
-    /** One service owns at most one independently versioned transaction. */
-    using Transaction = std::variant<std::monostate,
-                                     state::activity::PendingAllocation,
-                                     activity_message::ActivityPlan,
-                                     state::matchmaking::PendingMutation,
-                                     EquipmentSwapTransaction,
-                                     SocketPlugTransaction,
-                                     ItemStateTransaction,
-                                     ItemAcquisitionTransaction,
-                                     ProfileItemAcquisitionTransaction,
-                                     ItemDismantleTransaction>;
-    Transaction transaction{};
+    /** Opcode 501 created a character; the current peer owes its post-create Queuez publication. */
+    bool hasCreatedCharacter{};
+    std::uint64_t createdCharacterSoid{};
+    /** Opcode 502 prepared one character-select deletion and resident release set. */
+    bool hasCharacterDeletion{};
+    state::PendingCharacterDeletion characterDeletion{};
+    /** Opcode 403/404 prepared a selected-character inventory move for this service transaction. */
+    bool hasEquipmentMutation{};
+    state::PendingInventoryMove equipmentMutation{};
+    /** Opcode 1820 prepared one selected-character Collections acquisition. */
+    bool hasItemAcquisition{};
+    state::PendingItemAcquisition itemAcquisition{};
+    /** Opcode 1820 prepared one account-wide profile-stack acquisition. */
+    bool hasProfileItemAcquisition{};
+    state::PendingProfileItemAcquisition profileItemAcquisition{};
+    /** Opcode 402 prepared one selected-character unequipped-item dismantle. */
+    bool hasItemDismantle{};
+    state::PendingItemDismantle itemDismantle{};
+    /** Opcode 402 prepared an account-wide profile-stack decrement/removal. */
+    bool hasProfileItemDismantle{};
+    state::PendingProfileItemDismantle profileItemDismantle{};
+    /** Opcode 903/1901 prepared one owned-item socket/appearance plug replacement. */
+    bool hasSocketMutation{};
+    state::PendingSocketPlug socketMutation{};
+    /** Opcode 406 prepared one accumulated owned-item state change. */
+    bool hasItemStateMutation{};
+    state::PendingItemState itemStateMutation{};
+    bool hasActivitySessionAllocation{};
+    state::activity::PendingAllocation activitySessionAllocation{};
+    bool hasActivityTransaction{};
+    activity_message::ActivityPlan activityPlan{};
+    bool hasMatchmakingMutation{};
+    state::matchmaking::PendingMutation matchmakingMutation{};
 };
-
-/** @return The service transaction of the requested type, or null for another route. */
-template <typename Transaction>
-[[nodiscard]] Transaction* transaction_if(ServiceOutcome& outcome) noexcept {
-    return std::get_if<Transaction>(&outcome.transaction);
-}
-
-/** @return The service transaction of the requested type, or null for another route. */
-template <typename Transaction>
-[[nodiscard]] const Transaction* transaction_if(const ServiceOutcome& outcome) noexcept {
-    return std::get_if<Transaction>(&outcome.transaction);
-}
 
 /** Outbound delivery behavior picked for one authenticated request service. */
 enum class ResponseMode : std::uint8_t {
@@ -202,7 +174,6 @@ namespace push {
  * @param written Existing byte count, updated after each complete push is appended.
  * @param after Receives the queuez state published after caller output is copied.
  * @param armsRepush Receives whether the Family-4 companion needs its delayed second copy.
- * @param armsBannerRepush Receives whether a family-zero body needs its delayed second copy.
  */
 void append_queuez_notification(Scratch& scratch,
                                 const queuez::SessionState& before,
@@ -212,18 +183,7 @@ void append_queuez_notification(Scratch& scratch,
                                 std::span<std::byte> response,
                                 std::size_t& written,
                                 queuez::SessionState& after,
-                                bool& armsRepush,
-                                bool& armsBannerRepush) noexcept;
-
-/** Appends one next-version full Family-4 snapshot used to resynchronize another peer. */
-[[nodiscard]] bool
-append_account_resync_notification(Scratch& scratch,
-                                   const queuez::SessionState& before,
-                                   std::span<const std::byte, state::kAesKeySize> key,
-                                   std::array<std::byte, state::kBapNonceSize>& nonce,
-                                   std::span<std::byte> response,
-                                   std::size_t& written,
-                                   queuez::SessionState& after) noexcept;
+                                bool& armsRepush) noexcept;
 
 /**
  * Appends the family-zero banner pair as its own notification.
@@ -305,130 +265,6 @@ append_select_character_notification(Scratch& scratch,
                                      std::span<const std::byte, state::kBapNonceSize> nonce,
                                      std::span<std::byte> response,
                                      std::size_t& written) noexcept;
-
-/** Appends the opcode-403 Family-4 character upsert that exposes the equipped item swap. */
-[[nodiscard]] bool
-append_equipment_swap_notification(Scratch& scratch,
-                                   const queuez::EquipmentSwap& swap,
-                                   const state::PendingEquipmentSwap& mutation,
-                                   std::span<const std::byte, state::kAesKeySize> key,
-                                   std::span<const std::byte, state::kBapNonceSize> nonce,
-                                   std::span<std::byte> response,
-                                   std::size_t& written) noexcept;
-
-/** Appends the opcode-406 Family-4 character upsert carrying changed inventory-row flags. */
-[[nodiscard]] bool
-append_item_state_notification(Scratch& scratch,
-                               const queuez::EquipmentSwap& update,
-                               const state::PendingItemState& mutation,
-                               std::span<const std::byte, state::kAesKeySize> key,
-                               std::span<const std::byte, state::kBapNonceSize> nonce,
-                               std::span<std::byte> response,
-                               std::size_t& written) noexcept;
-
-/**
- * Appends the same-character Family-0 appearance upsert paired with one equipment swap.
- * The
- * update owns its nonce advance only after the complete notification fits.
- */
-[[nodiscard]] bool
-append_equipment_appearance_refresh_notification(Scratch& scratch,
-                                                 const queuez::CharacterAppearanceRefresh& refresh,
-                                                 const state::PendingEquipmentSwap& mutation,
-                                                 std::span<const std::byte, state::kAesKeySize> key,
-                                                 std::array<std::byte, state::kBapNonceSize>& nonce,
-                                                 std::span<std::byte> response,
-                                                 std::size_t& written) noexcept;
-
-/** Appends the Family-0 refresh owed by a socket change on an equipped item. */
-[[nodiscard]] bool
-append_socket_appearance_refresh_notification(Scratch& scratch,
-                                              const queuez::CharacterAppearanceRefresh& refresh,
-                                              const state::PendingSocketPlug& mutation,
-                                              std::span<const std::byte, state::kAesKeySize> key,
-                                              std::array<std::byte, state::kBapNonceSize>& nonce,
-                                              std::span<std::byte> response,
-                                              std::size_t& written) noexcept;
-
-/** Appends a Family-3 character record followed by the changed account roster after equip. */
-[[nodiscard]] bool
-append_equipment_roster_refresh_notification(Scratch& scratch,
-                                             const queuez::RosterAppearanceRefresh& refresh,
-                                             const state::PendingEquipmentSwap& mutation,
-                                             std::span<const std::byte, state::kAesKeySize> key,
-                                             std::array<std::byte, state::kBapNonceSize>& nonce,
-                                             std::span<std::byte> response,
-                                             std::size_t& written) noexcept;
-
-/** Appends a Family-3 character-only appearance refresh after an equipped socket change. */
-[[nodiscard]] bool
-append_socket_roster_refresh_notification(Scratch& scratch,
-                                          const queuez::RosterAppearanceRefresh& refresh,
-                                          const state::PendingSocketPlug& mutation,
-                                          std::span<const std::byte, state::kAesKeySize> key,
-                                          std::array<std::byte, state::kBapNonceSize>& nonce,
-                                          std::span<std::byte> response,
-                                          std::size_t& written) noexcept;
-
-/** Refreshes the selected character's complete Family-0 appearance from committed State. */
-[[nodiscard]] bool
-append_account_resync_appearance_notification(Scratch& scratch,
-                                              const queuez::SessionState& before,
-                                              std::span<const std::byte, state::kAesKeySize> key,
-                                              std::array<std::byte, state::kBapNonceSize>& nonce,
-                                              std::span<std::byte> response,
-                                              std::size_t& written,
-                                              queuez::SessionState& after) noexcept;
-
-/** Refreshes the selected character and account roster from committed State. */
-[[nodiscard]] bool
-append_account_resync_roster_notification(Scratch& scratch,
-                                          const queuez::SessionState& before,
-                                          std::span<const std::byte, state::kAesKeySize> key,
-                                          std::array<std::byte, state::kBapNonceSize>& nonce,
-                                          std::span<std::byte> response,
-                                          std::size_t& written,
-                                          queuez::SessionState& after) noexcept;
-
-/** Appends the opcode-903 Family-4 item-instance upsert exposing one socket selection. */
-[[nodiscard]] bool
-append_socket_plug_notification(Scratch& scratch,
-                                const queuez::SocketPlug& socketPlug,
-                                const state::PendingSocketPlug& mutation,
-                                std::span<const std::byte, state::kAesKeySize> key,
-                                std::span<const std::byte, state::kBapNonceSize> nonce,
-                                std::span<std::byte> response,
-                                std::size_t& written) noexcept;
-
-/** Appends a Family-4 character upsert plus newly acquired item-instance upsert. */
-[[nodiscard]] bool
-append_item_acquisition_notification(Scratch& scratch,
-                                     const queuez::ItemAcquisition& acquisition,
-                                     const state::PendingItemAcquisition& mutation,
-                                     std::span<const std::byte, state::kAesKeySize> key,
-                                     std::span<const std::byte, state::kBapNonceSize> nonce,
-                                     std::span<std::byte> response,
-                                     std::size_t& written) noexcept;
-
-/** Appends one full Family-4 account upsert for a profile-stack acquisition. */
-[[nodiscard]] bool
-append_profile_item_acquisition_notification(Scratch& scratch,
-                                             const queuez::ProfileItemAcquisition& acquisition,
-                                             const state::PendingProfileItemAcquisition& mutation,
-                                             std::span<const std::byte, state::kAesKeySize> key,
-                                             std::span<const std::byte, state::kBapNonceSize> nonce,
-                                             std::span<std::byte> response,
-                                             std::size_t& written) noexcept;
-
-/** Appends a Family-4 character upsert followed by one empty item-instance release. */
-[[nodiscard]] bool
-append_item_dismantle_notification(Scratch& scratch,
-                                   const queuez::ItemDismantle& dismantle,
-                                   const state::PendingItemDismantle& mutation,
-                                   std::span<const std::byte, state::kAesKeySize> key,
-                                   std::span<const std::byte, state::kBapNonceSize> nonce,
-                                   std::span<std::byte> response,
-                                   std::size_t& written) noexcept;
 
 } // namespace push
 

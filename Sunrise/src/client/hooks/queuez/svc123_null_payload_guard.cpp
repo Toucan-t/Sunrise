@@ -2,7 +2,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -71,25 +70,7 @@ __declspec(noinline) char __fastcall handler(void* self,
         return kNotHandled;
     }
     const Handler original = g_original.load(std::memory_order_acquire);
-    const char result = original != nullptr ? original(self, context, message) : kNotHandled;
-    std::uint32_t messageId = 0;
-    if (message != nullptr) {
-        std::memcpy(&messageId, message + MessageLayout::id, sizeof messageId);
-    }
-    std::array<char, core::log::kLineCapacity> line{};
-    const int count = std::snprintf(line.data(),
-                                    line.size(),
-                                    "ev=queuez stage=native_handler result=%d message_id=%u "
-                                    "payload=0x%llX",
-                                    static_cast<int>(result),
-                                    messageId,
-                                    static_cast<unsigned long long>(payload));
-    if (count > 0) {
-        core::log::write(core::log::Channel::client,
-                         core::log::Level::debug,
-                         {line.data(), static_cast<std::size_t>(count)});
-    }
-    return result;
+    return original != nullptr ? original(self, context, message) : kNotHandled;
 }
 
 } // namespace

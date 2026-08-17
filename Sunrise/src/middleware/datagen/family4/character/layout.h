@@ -38,7 +38,7 @@ inline constexpr std::size_t kObjectiveValueCapacity = 768;
 inline constexpr std::size_t kCreationHeaderSize = 36;
 /** The next inventory serial is followed by 4 reserved alignment bytes. */
 inline constexpr std::size_t kInventorySerialPaddingSize = 4;
-/** 4 opaque bytes precede the character inventory-change list. */
+/** 4 opaque bytes precede the transient inventory-change list. */
 inline constexpr std::size_t kInventoryChangeUnknownSize = 4;
 /** The character object carries at most 16 transient inventory-change records. */
 inline constexpr std::size_t kInventoryChangeRecordCapacity = 16;
@@ -112,23 +112,17 @@ struct RosterMirrorEntry {
 
 /** One transient inventory mutation consumed by the native character-object observer. */
 struct InventoryChangeRecord {
-    /** Rising record identity; the native observer prefers the greatest matching value. */
     std::uint16_t sequence{};
     std::uint16_t reserved{};
-    /** Mutation serial of the inventory row this record describes. */
     std::int32_t mutationSerial{};
-    /** Nonzero mutation kind. Kind 1 follows the ordinary item-acquisition path. */
     std::uint8_t kind{};
     std::uint8_t reservedKind{};
-    /** Native observer policy bits; 0 enables the ordinary acquisition path. */
     std::uint16_t flags{};
 };
 
-/** Header and fixed record bank occupying bytes 0x2BFC through 0x2CBF. */
+/** Header and fixed record bank occupying the former 200-byte inventory padding. */
 struct InventoryChangeList {
-    /** Ring slot the native producer will write next. */
     std::uint16_t writeSlot{};
-    /** Sequence assigned to the next native record. */
     std::uint16_t nextSequence{};
     std::array<InventoryChangeRecord, kInventoryChangeRecordCapacity> records{};
 };
@@ -158,7 +152,7 @@ struct Object {
     std::array<RosterMirrorEntry, kRosterMirrorCapacity> rosterMirror{};
     std::array<std::byte, kRosterDestinationPaddingSize> rosterDestinationPadding{};
     std::uint32_t lastOrbitedDestination{};
-    /** One bit per inventory row, set for every row the loadout occupies. */
+    /** Transient acquisition-feedback bitmap; canonical snapshots leave every bit clear. */
     std::array<std::byte, kNewItemFlagByteCount> newItemFlags{};
     /** Per-row acknowledgement watermarks mirrored from the matching item instances. */
     std::array<std::int32_t, kInstanceProgressWatermarkCapacity> instanceProgressWatermarks{};
@@ -185,17 +179,15 @@ static_assert(sizeof(EquipmentSummary)
               == kSummaryArrayCount * kEquipmentCapacity * sizeof(EquipmentSummaryEntry)
                      + kSummaryIntegerCount * sizeof(std::int32_t)
                      + kSummaryScalarCount * sizeof(float));
-static_assert(sizeof(InventoryChangeRecord)
-              == 3 * sizeof(std::uint16_t) + sizeof(std::int32_t) + 2 * sizeof(std::uint8_t));
-static_assert(offsetof(InventoryChangeRecord, mutationSerial) == 2 * sizeof(std::uint16_t));
-static_assert(offsetof(InventoryChangeRecord, kind)
-              == 2 * sizeof(std::uint16_t) + sizeof(std::int32_t));
-static_assert(offsetof(InventoryChangeRecord, flags)
-              == 2 * sizeof(std::uint16_t) + sizeof(std::int32_t) + 2 * sizeof(std::uint8_t));
+static_assert(sizeof(InventoryChangeRecord) == 12);
+static_assert(offsetof(InventoryChangeRecord, sequence) == 0);
+static_assert(offsetof(InventoryChangeRecord, mutationSerial) == 4);
+static_assert(offsetof(InventoryChangeRecord, kind) == 8);
+static_assert(offsetof(InventoryChangeRecord, flags) == 10);
 static_assert(sizeof(InventoryChangeList)
-              == 2 * sizeof(std::uint16_t)
+              == sizeof(std::uint32_t)
                      + kInventoryChangeRecordCapacity * sizeof(InventoryChangeRecord));
-static_assert(offsetof(InventoryChangeList, records) == 2 * sizeof(std::uint16_t));
+static_assert(offsetof(InventoryChangeList, records) == 4);
 static_assert(sizeof(Object) == kObjectSize);
 static_assert(std::is_trivially_copyable_v<Object>);
 

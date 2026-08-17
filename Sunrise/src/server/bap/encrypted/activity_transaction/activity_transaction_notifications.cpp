@@ -1,8 +1,5 @@
 #include "activity_transaction_notifications.h"
 
-#include "../../../../core/logging/log.h"
-#include "../../../gameplay/gameplay_advertisement.h"
-#include "../push/activity/activity_arrival.h"
 #include "../push/activity/activity_global_state_push.h"
 #include "../push/activity/activity_membership_push.h"
 #include "../push/activity/activity_message_push.h"
@@ -10,28 +7,6 @@
 
 namespace sunrise::server::bap::encrypted::activity_transaction {
 namespace {
-
-/**
- * Reports whether the citizen advertisement this membership body would carry is still coming.
- * The client applies one membership update per revision, so a body sent before the region's host
- * session exists spends that revision on a record no later push can fill. Holding costs one
- * keepalive.
- * @param activity Prepared activity transaction, whose region this body publishes.
- * @return True when the push has to wait.
- */
-[[nodiscard]] bool advertisement_pending(const activity_message::ActivityPlan& activity) noexcept {
-    // Take the delta's region, not the committed one. Staging runs before the commit, so the
-    // committed value still names the region the player has left.
-    const server::gameplay::AdvertisementState state = server::gameplay::advertisement_state(
-        push::activity::planned_region(activity.membershipMutation, activity.sessionId).index);
-    if (state != server::gameplay::AdvertisementState::pending) {
-        return false;
-    }
-    core::log::write(core::log::Channel::server,
-                     core::log::Level::debug,
-                     "ev=gameplay stage=membership result=held reason=no_host_session");
-    return true;
-}
 
 /**
  * Stages the whole host snapshot the client's state-refresh request asks for.
@@ -55,7 +30,7 @@ namespace {
                                  std::size_t& written) noexcept {
     bool staged = push::activity::append_global_state_notification(
         scratch, activity.sessionId, key, nonce, response, written);
-    if (activity.membershipMutation.hasSnapshot && !advertisement_pending(activity)) {
+    if (activity.membershipMutation.hasSnapshot) {
         staged = push::activity::append_membership_notification(
                      scratch, activity, key, nonce, response, written)
                  || staged;
@@ -86,22 +61,16 @@ namespace {
                                        std::span<std::byte> response,
                                        std::size_t& written) noexcept {
     bool staged = false;
-    bool held = false;
     if (activity.membershipMutation.hasSnapshot) {
-        held = advertisement_pending(activity);
-        if (!held) {
-            staged = push::activity::append_membership_notification(
-                scratch, activity, key, nonce, response, written);
-        }
+        staged = push::activity::append_membership_notification(
+            scratch, activity, key, nonce, response, written);
     }
     if (activity.regionMoved) {
         staged = push::activity::append_roster_notification(
                      session, scratch, key, nonce, response, written, false)
                  || staged;
     }
-    // A held membership is not a failed staging. A false here drops the very commit that moved
-    // the region the held body waits for. The keepalive publishes it on a later slice.
-    return staged || held;
+    return staged;
 }
 
 } // namespace

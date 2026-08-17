@@ -28,7 +28,7 @@ struct Equipped {
     std::size_t laneCount{};
 };
 
-/** Selects class-qualified art when present, otherwise the definition's generic arrangement. */
+/** Selects class-qualified art when present, otherwise the generic/legacy arrangement. */
 [[nodiscard]] constexpr std::uint16_t
 select_art_arrangement(const details::Definition& detail,
                        state::CharacterClass characterClass) noexcept {
@@ -37,7 +37,10 @@ select_art_arrangement(const details::Definition& detail,
         && detail.artArrangementIndices[classSlot] != details::kUnavailableArtIndex) {
         return detail.artArrangementIndices[classSlot];
     }
-    return detail.artArrangementIndices.front();
+    if (detail.artArrangementIndices.front() != details::kUnavailableArtIndex) {
+        return detail.artArrangementIndices.front();
+    }
+    return detail.artArrangementIndex;
 }
 
 /**
@@ -59,7 +62,6 @@ void apply_sentinels(layout::Appearance& appearance) noexcept;
 /**
  * Fills each equipped render row with its instance, definition, art and material pairs.
  * @param instances Resolved item instances belonging to one character.
- * @param characterClass Class whose art rows are selected when a definition carries them.
  * @param appearance Appearance block receiving the render rows.
  * @return True when every instance addresses a render row.
  */

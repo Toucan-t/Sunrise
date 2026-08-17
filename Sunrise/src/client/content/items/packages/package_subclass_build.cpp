@@ -1,6 +1,7 @@
 #include <array>
 
 #include "../../../../state/account/account_state.h"
+#include "../../../../state/account/inventory/item_name_catalog.h"
 #include "../../../../state/build_data/runtime.h"
 #include "../../../../state/runtime/runtime.h"
 #include "internal.h"
@@ -20,33 +21,25 @@ constexpr std::size_t kSubclassSlot =
  * @param socketEntryListIndex Receives the subclass's socket-entry-list index.
  * @return True when the character equips a subclass whose detail is published.
  */
-[[nodiscard]] bool subclass_list(const state::CharacterState& character,
-                                 std::uint16_t& socketEntryListIndex,
-                                 const char*& reason) noexcept {
-    const auto& slot = character.equipment.slots[kSubclassSlot];
+[[nodiscard]] bool subclass_list(std::uint32_t definitionHash,
+                                 std::uint16_t& socketEntryListIndex) noexcept {
     state::build_data::items::Definition item{};
     state::build_data::items::details::Definition detail{};
-    reason = "subclass_slot";
-    if (!slot.has_value()) {
-        return false;
-    }
-    reason = "subclass_item";
-    if (!state::build_data::find_item_definition_hash(slot->definitionHash, item)) {
-        return false;
-    }
-    reason = "subclass_detail";
-    if (!state::build_data::find_configured_item_detail(item.definitionIndex, detail)) {
+    if (!state::build_data::find_item_definition_hash(definitionHash, item)
+        || !state::build_data::find_configured_item_detail(item.definitionIndex, detail)) {
         return false;
     }
     socketEntryListIndex = detail.socketEntryListIndex;
     return true;
 }
 
-/**
- * @param rows Rows built so far.
- * @param row Candidate whose key is tested against them.
- * @return True when the candidate's key is already held.
- */
+[[nodiscard]] bool subclass_list(const state::CharacterState& character,
+                                 std::uint16_t& socketEntryListIndex) noexcept {
+    const auto& slot = character.equipment.slots[kSubclassSlot];
+    return slot.has_value() && subclass_list(slot->definitionHash, socketEntryListIndex);
+}
+
+/** @param rows Rows built so far. @return True when the candidate's key is already held. */
 [[nodiscard]] bool held(std::span<const domain::Definition> rows,
                         const domain::Definition& row) noexcept {
     for (const domain::Definition& existing : rows) {
@@ -81,62 +74,83 @@ bool build_character_abilities(const reader::Source& source,
     count = 0;
     std::uint32_t tableTag = 0;
     tables::Array rows{};
-    if (!tables::slot_tag(root, tables::kSocketEntryListTableSlot, tableTag) || tableTag == 0) {
-        report_ability_failure("table_slot", 0, root.size(), tableTag);
-        return false;
-    }
-    if (!reader::read_tag(source, scratch, tableTag, table)) {
-        report_ability_failure("table_read", 0, tableTag, 0);
-        return false;
-    }
-    if (!tables::find_array_at(
+    if (!tables::slot_tag(root, tables::kSocketEntryListTableSlot, tableTag) || tableTag == 0
+        || !reader::read_tag(source, scratch, tableTag, table)
+        || !tables::find_array_at(
             std::span<const std::byte>{table}, tables::kTableArrayDescriptor, rows)) {
-        report_ability_failure("table_array", 0, table.size(), 0);
         return false;
     }
-    const state::AccountState account = state::account_snapshot();
-    for (std::size_t character = 0; character < account.characterCount && count < output.size();
-         ++character) {
+    const state::AccountState configured = state::configured_account_snapshot();
+    const state::AccountState active = state::account_snapshot();
+    const auto append_row = [&](std::uint16_t socketEntryListIndex,
+                                const domain::Selection& selection) -> bool {
         domain::Definition row{};
-        const char* subclassReason = "subclass";
-        if (!subclass_list(
-                account.characters[character], row.socketEntryListIndex, subclassReason)) {
-            const auto& subclass = account.characters[character].equipment.slots[kSubclassSlot];
-            report_ability_failure(
-                subclassReason, character, subclass.has_value() ? subclass->definitionHash : 0, 0);
-            continue;
-        }
-        // The selection is held in a local because the row it also keys is the build's output.
-        const domain::Selection selection = selection_of(account.characters[character]);
+        row.socketEntryListIndex = socketEntryListIndex;
         row.selection = selection;
         if (held(output.first(count), row)) {
-            continue;
+            return true;
+        }
+        if (count >= output.size()) {
+            return false;
         }
         tables::IndexRow indexRow{};
         if (!tables::index_row(
                 std::span<const std::byte>{table}, rows, row.socketEntryListIndex, indexRow)
-            || indexRow.targetTag == 0) {
-            report_ability_failure("index_row", character, row.socketEntryListIndex, rows.count);
-            continue;
-        }
-        if (!reader::read_tag(source, scratch, indexRow.targetTag, definition)) {
-            report_ability_failure(
-                "definition_read", character, row.socketEntryListIndex, indexRow.targetTag);
-            continue;
-        }
-        if (!build_ability_buckets(
+            || indexRow.targetTag == 0
+            || !reader::read_tag(source, scratch, indexRow.targetTag, definition)
+            || !build_ability_buckets(
                 source, scratch, std::span<const std::byte>{definition}, blob, selection, row)) {
-            const std::size_t packedSelection =
-                selection.movementEntry | (selection.grenadeEntry << 8U)
-                | (selection.superEntry << 16U) | (selection.meleeEntry << 24U);
-            report_ability_failure(
-                "bucket_build", character, row.socketEntryListIndex, packedSelection);
-            continue;
+            return true;
         }
         output[count++] = row;
+        return true;
+    };
+
+    const auto append_account = [&](const state::AccountState& account) -> bool {
+        for (std::size_t character = 0; character < account.characterCount; ++character) {
+            std::uint16_t socketEntryListIndex = 0;
+            if (subclass_list(account.characters[character], socketEntryListIndex)
+                && !append_row(socketEntryListIndex, selection_of(account.characters[character]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!append_account(configured) || !append_account(active)) {
+        return false;
     }
-    if (count == 0) {
-        report_ability_failure("empty", account.characterCount, rows.count, output.size());
+
+    // The editor exposes only a handful of catalogue subclasses. Build each one against the
+    // class selections represented by both templates and the persistent active roster.
+    const auto append_catalog_for_account = [&](
+                                                const state::account::inventory::item_names::Option& option,
+                                                std::uint16_t socketEntryListIndex,
+                                                const state::AccountState& account) -> bool {
+        for (std::size_t character = 0; character < account.characterCount; ++character) {
+            if (option.characterClass >= 0
+                && option.characterClass
+                       != static_cast<std::int8_t>(account.characters[character].characterClass)) {
+                continue;
+            }
+            if (!append_row(socketEntryListIndex, selection_of(account.characters[character]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    for (const state::account::inventory::item_names::Option& option :
+         state::account::inventory::item_names::options()) {
+        if (option.slot != state::account::inventory::EquipmentSlot::subclass) {
+            continue;
+        }
+        std::uint16_t socketEntryListIndex = 0;
+        if (!subclass_list(option.definitionHash, socketEntryListIndex)) {
+            continue;
+        }
+        if (!append_catalog_for_account(option, socketEntryListIndex, configured)
+            || !append_catalog_for_account(option, socketEntryListIndex, active)) {
+            return false;
+        }
     }
     return true;
 }

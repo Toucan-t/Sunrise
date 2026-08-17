@@ -1,21 +1,20 @@
 # Sunrise
 
+# THIS is a pretty sloppy mess of a fork, I don't recommend downloading this. It's for me, if you wanna play with it go ham
+
+
 Destiny 2 Offline Exploration Mod
 
 > This mod installs onto an old build of the game and allows you to play it offline, loading into
 > destinations and exploring them.
 >
-> Most gameplay features are not currently supported. (Missions, Enemies, NPCs, Quests, Persistent Saves, ...)
+> No other features are currently supported. (Missions, Enemies, NPCs, Quests, Inventory
+> Management, ...)
 
 - [Install Instructions](https://github.com/stanuwu/Sunrise/wiki/Installing)
 - [FAQ](https://github.com/stanuwu/Sunrise/wiki/FAQ)
 - [Common Issues](https://github.com/stanuwu/Sunrise/wiki/Common-Issues)
 - [Discord](https://discord.gg/22JS6et5k9)
-
-## Features
-- Load into any Destination (matchmade activities are currently broken)
-- Exploration Features (Fly, Noclip, Activity Override, ...)
-- Basic Inventory Management
 
 ## WIP
 
@@ -32,13 +31,6 @@ If you want to support my open source work you can find the means on my
 All content released under this project is free and open source. If someone is trying to sell you
 something you are getting scammed.
 
-## Rules
-Issues are for bug reports only.
-
-PRs are for pull requests only.
-
-Do not go and argue/chat there, you can do that on the discord.
-
 ## Contributing
 
 Pull Requests are welcome. Please follow these rules:
@@ -50,9 +42,6 @@ Pull Requests are welcome. Please follow these rules:
 - **Provide Documentation** - Please explain what you changed, why you changed it and the effects it
   has in detail, it saves me a lot of work.
 - **Follow Up** - If something with the PR is not right, I will reply and ask you to fix it.
-- **One Feature** - Do not put multiple features into one PR.
-- **Complete Implementations** - Do not PR features that are not completed and/or have non functional parts.
-- **Server Focus** - For features that are intended to be part of the server, don't abuse client patches. Sometimes its needed but mostly everything should go through the right requests and pushes.
 
 ## Credits
 

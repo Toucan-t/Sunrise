@@ -11,16 +11,15 @@
 
 namespace sunrise::server::bap::encrypted::push::snapshot {
 
+/** Reserved presentation-only character key used to initialize the cold creator renderer. */
+inline constexpr std::uint64_t kCreatorBootstrapCharacterSoid = 0xFFFFFFFFFFFFF001ULL;
+
 /** Account and selected-character identity take the first two family-four descriptors. */
 inline constexpr std::size_t kFamily4IdentityObjectCount = 2;
 /**
- * Family four carries both identity objects plus one record per equipped or unequipped character
- *
- * item and every resident-backed profile stack. The character inventory, equip-summary, and
- *
- * profile action-source readers all follow instance SOIDs, so every nonzero row key needs a
- *
- * published record. The fixed profile-row capacity also bounds future runtime acquisitions.
+ * Family four carries both identity objects plus one item record per owned item, for every
+ * character. The equip-summary reader looks up an instance with no null check, so no character in
+ * the roster may point at a record this snapshot leaves out.
  */
 inline constexpr std::size_t kObjectCapacity =
     kFamily4IdentityObjectCount
@@ -54,14 +53,201 @@ struct Prepared {
                                    Prepared& prepared) noexcept;
 
 /**
- * Rebuilds the active account family as a full snapshot at the peer's next version.
- * This is
- * used only to repair another authenticated peer after shared State changes.
+ * Builds a Family-4 incremental containing only the currently selected character object.
+ * This deliberately avoids the account object: selection handling has already shown that a live
+ * full account-body replacement can erase client-resident settings that Sunrise does not author.
+ * @param scratch Object and compression storage owned by the lock.
+ * @param familyRootSoid Active Family-4 root.
+ * @param version Next Family-4 incremental version.
+ * @param characterSoid Character that must currently be selected.
+ * @param prepared Gets the one-object incremental.
+ * @return True when the selected character and installed mappings encode completely.
  */
-[[nodiscard]] bool prepare_family4_refresh(Scratch& scratch,
+[[nodiscard]] bool prepare_character_refresh(Scratch& scratch,
+                                             std::uint64_t familyRootSoid,
+                                             std::int32_t version,
+                                             std::uint64_t characterSoid,
+                                             Prepared& prepared) noexcept;
+
+/**
+ * Builds a Family-4 incremental containing only the resident account object. Profile inventory
+ * debug edits use this instead of rebuilding the full manifest, because adding a profile row may
+ * legitimately change account contents while every resident object identity stays unchanged.
+ */
+[[nodiscard]] bool prepare_account_refresh(Scratch& scratch,
                                            std::uint64_t familyRootSoid,
                                            std::int32_t version,
                                            Prepared& prepared) noexcept;
+
+/** Builds the same one-account-object incremental from an explicit account after-image. */
+[[nodiscard]] bool prepare_account_refresh_from_account(Scratch& scratch,
+                                                        std::uint64_t familyRootSoid,
+                                                        std::int32_t version,
+                                                        const state::AccountState& account,
+                                                        Prepared& prepared) noexcept;
+
+
+/**
+ * Builds a profile-stack after-image, optionally adding a new resident shader/mod source first.
+ * A positive acquisition mutation serial/quantity pair emits the one-shot native profile-inventory
+ * change descriptor used by Collections pickup feedback. Pass zeroes for ordinary/debug refreshes.
+ */
+[[nodiscard]] bool prepare_profile_item_refresh_from_account(
+    Scratch& scratch,
+    std::uint64_t familyRootSoid,
+    std::int32_t version,
+    const state::AccountState& account,
+    std::uint64_t instanceSoid,
+    bool addResident,
+    std::int32_t acquisitionMutationSerial,
+    std::int32_t acquisitionQuantity,
+    Prepared& prepared) noexcept;
+
+/**
+ * Builds a character-deletion account after-image followed by empty-payload releases for any
+ * deleted character/item residents that the current peer actually owns.
+ */
+[[nodiscard]] bool prepare_character_deletion_from_account(
+    Scratch& scratch,
+    std::uint64_t familyRootSoid,
+    std::int32_t version,
+    const state::AccountState& account,
+    std::uint64_t deletedCharacterSoid,
+    bool releaseCharacterResident,
+    std::span<const std::uint64_t> releasedItemSoids,
+    Prepared& prepared) noexcept;
+
+/** Builds a profile-stack after-image and optionally releases its final resident action source. */
+[[nodiscard]] bool prepare_profile_item_dismantle_from_account(
+    Scratch& scratch,
+    std::uint64_t familyRootSoid,
+    std::int32_t version,
+    const state::AccountState& account,
+    std::uint64_t releasedInstanceSoid,
+    Prepared& prepared) noexcept;
+
+/** Builds the same selected-character incremental from a checked uncommitted account after-image. */
+[[nodiscard]] bool prepare_character_refresh_from_account(Scratch& scratch,
+                                                          std::uint64_t familyRootSoid,
+                                                          std::int32_t version,
+                                                          const state::AccountState& account,
+                                                          std::uint64_t characterSoid,
+                                                          Prepared& prepared) noexcept;
+
+/**
+ * Builds a manifest-preserving equipped-definition refresh in dependency order. The changed item
+ * instance is always first. When its owner is the selected resident character, that character
+ * after-image follows in the same Family-4 incremental so the Client re-evaluates the new body.
+ * Inactive owners have no resident character object and therefore publish only the item instance.
+ * @param scratch Lock-owned encoding/compression storage.
+ * @param familyRootSoid Active Family-4 account root.
+ * @param version Next Family-4 incremental version.
+ * @param characterSoid Character that owns the edited equipped instance.
+ * @param instanceSoid Existing equipped item-instance SOID whose definition changed.
+ * @param prepared Gets one or two dependency-ordered object descriptors.
+ */
+[[nodiscard]] bool prepare_equipment_refresh(Scratch& scratch,
+                                             std::uint64_t familyRootSoid,
+                                             std::int32_t version,
+                                             std::uint64_t characterSoid,
+                                             std::uint64_t instanceSoid,
+                                             Prepared& prepared) noexcept;
+
+/**
+ * Builds a manifest-preserving socket/item-body refresh from an explicit account after-image.
+ * The changed item instance is first. Equipped appearance actions may request the selected
+ * character after-image as the second descriptor; unequipped socket edits publish the item only.
+ */
+[[nodiscard]] bool prepare_socket_refresh_from_account(Scratch& scratch,
+                                                       std::uint64_t familyRootSoid,
+                                                       std::int32_t version,
+                                                       const state::AccountState& account,
+                                                       std::uint64_t characterSoid,
+                                                       std::uint64_t instanceSoid,
+                                                       bool includeCharacter,
+                                                       Prepared& prepared) noexcept;
+
+/** Builds the same socket refresh from the currently committed runtime account. */
+[[nodiscard]] bool prepare_socket_refresh(Scratch& scratch,
+                                          std::uint64_t familyRootSoid,
+                                          std::int32_t version,
+                                          std::uint64_t characterSoid,
+                                          std::uint64_t instanceSoid,
+                                          bool includeCharacter,
+                                          Prepared& prepared) noexcept;
+
+/**
+ * Builds one new item-instance resident for the debug inventory seeding path. The character object
+ * deliberately follows in the next Family-4 version, after the new dependency has become resident.
+ */
+[[nodiscard]] bool prepare_inventory_item_addition(Scratch& scratch,
+                                                   std::uint64_t familyRootSoid,
+                                                   std::int32_t version,
+                                                   std::uint64_t characterSoid,
+                                                   std::uint64_t instanceSoid,
+                                                   Prepared& prepared) noexcept;
+
+/** Builds a native acquisition incremental from one uncommitted account after-image. */
+[[nodiscard]] bool prepare_item_acquisition_from_account(
+    Scratch& scratch,
+    std::uint64_t familyRootSoid,
+    std::int32_t version,
+    const state::AccountState& account,
+    std::uint64_t characterSoid,
+    std::uint64_t instanceSoid,
+    Prepared& prepared) noexcept;
+
+/** Builds a native dismantle incremental: character after-image first, then item release. */
+[[nodiscard]] bool prepare_item_dismantle_from_account(
+    Scratch& scratch,
+    std::uint64_t familyRootSoid,
+    std::int32_t version,
+    const state::AccountState& account,
+    std::uint64_t characterSoid,
+    std::uint64_t releasedInstanceSoid,
+    Prepared& prepared) noexcept;
+
+/**
+ * Builds a Family-4 incremental containing only one newly created character's item instances.
+ * The account body is intentionally not republished: live full-account replacement can erase
+ * client-owned settings, while the Family-3 roster update carries the new roster row separately.
+ */
+[[nodiscard]] bool prepare_created_character_items(Scratch& scratch,
+                                                   std::uint64_t familyRootSoid,
+                                                   std::int32_t version,
+                                                   std::uint64_t characterSoid,
+                                                   Prepared& prepared) noexcept;
+
+/**
+ * Builds a Family-3 incremental containing only one character-select record.
+ * @param scratch Object and compression storage owned by the lock.
+ * @param familyRootSoid Active account root.
+ * @param version Next Family-3 incremental version.
+ * @param characterSoid Character record to rebuild.
+ * @param prepared Gets the one-object incremental.
+ * @return True when the character exists and its render/stat/ability record encodes completely.
+ */
+[[nodiscard]] bool prepare_roster_character_refresh(Scratch& scratch,
+                                                    std::uint64_t familyRootSoid,
+                                                    std::int32_t version,
+                                                    std::uint64_t characterSoid,
+                                                    Prepared& prepared) noexcept;
+
+/**
+ * Builds a Family-0 incremental containing only the selected character record. The anchor is
+ * unchanged when the selected SOID does not change, so it is deliberately not republished.
+ * @param scratch Object and compression storage owned by the lock.
+ * @param familyRootSoid Active account root.
+ * @param version Next Family-0 incremental version.
+ * @param characterSoid Character that must still be selected.
+ * @param prepared Gets the one-object incremental.
+ * @return True when the selected banner record encodes completely.
+ */
+[[nodiscard]] bool prepare_banner_character_refresh(Scratch& scratch,
+                                                    std::uint64_t familyRootSoid,
+                                                    std::int32_t version,
+                                                    std::uint64_t characterSoid,
+                                                    Prepared& prepared) noexcept;
 
 /**
  * Builds the family-zero banner anchor and the record for the character it names.
@@ -78,39 +264,5 @@ struct Prepared {
                                   std::int32_t version,
                                   std::uint64_t previousCharacter,
                                   Prepared& prepared) noexcept;
-
-/**
- * Builds the one-record Family-0 incremental that refreshes rendered equipment in place.
- * The record is encoded from the prepared State after-image because the equipment transaction is
- * not committed until both Family-4 and Family-0 frames fit.
- * @param scratch Raw object storage owned by the lock.
- * @param refresh Family-0 root, version, and resident the incremental is built against.
- * @param afterCharacter Prepared State after-image the record is encoded from.
- * @param characterIndex Position of that character in the account.
- * @param nativeEquipmentSlot Native slot whose rendered item changed.
- * @param replaceCharacterRecord Release and recreate the same resident record so same-instance
- *        shader and ornament changes rebuild the live-world render binding.
- * @param prepared Gets the descriptors and the scratch clear extent.
- * @return True when the character resolves and every object fits raw storage.
- */
-[[nodiscard]] bool
-prepare_character_appearance_refresh(Scratch& scratch,
-                                     const queuez::CharacterAppearanceRefresh& refresh,
-                                     const state::CharacterState& afterCharacter,
-                                     std::size_t characterIndex,
-                                     std::uint8_t nativeEquipmentSlot,
-                                     bool replaceCharacterRecord,
-                                     Prepared& prepared) noexcept;
-
-/**
- * Builds one Family-3 appearance increment from an uncommitted character after-image.
- * The
- * character record is always first; when requested, the changed account roster follows it.
- */
-[[nodiscard]] bool prepare_roster_appearance_refresh(Scratch& scratch,
-                                                     const queuez::RosterAppearanceRefresh& refresh,
-                                                     const state::CharacterState& afterCharacter,
-                                                     std::size_t characterIndex,
-                                                     Prepared& prepared) noexcept;
 
 } // namespace sunrise::server::bap::encrypted::push::snapshot

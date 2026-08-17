@@ -11,11 +11,10 @@ namespace sunrise::client::content::investment::worker {
 namespace {
 
 /**
- * Delay between bounded refresh slices.
- * A slice runs on every pump. The extraction is hundreds of slices and each bounds its own length,
- * so a delay on top only added waiting: at 50 ms it was most of what the boot spent extracting.
+ * Small yield between bounded refresh retries. The expensive item sweep itself is still one bounded
+ * operation, but a failed/not-yet-ready pass no longer immediately hammers the next game pump.
  */
-constexpr std::uint64_t kRefreshIntervalMilliseconds = 0;
+constexpr std::uint64_t kRefreshIntervalMilliseconds = 5;
 
 SRWLOCK g_lifecycleLock{SRWLOCK_INIT};
 bool g_accepting{};
@@ -46,7 +45,7 @@ void service(std::uint64_t nowMilliseconds) noexcept {
     }
     g_nextEligible = nowMilliseconds + kRefreshIntervalMilliseconds;
 
-    if (sunrise::client::content::investment::requires_package_sweep()) {
+    if (sunrise::client::content::investment::requires_process_freeze()) {
         g_overlayPending = true;
         if (sunrise::core::ui::busy::raise_early(
                 sunrise::core::ui::busy::Task::contentExtraction)) {

@@ -76,21 +76,14 @@ bool append_items(Scratch& scratch,
     return true;
 }
 
-/** Resolves one source-backed profile stack into the shared Family-4 item-instance schema. */
 bool resolve_profile_item_instance(const state::account::inventory::ProfileItem& profileItem,
                                    family4_datagen::instance::ResolvedInstance& output) noexcept {
     output = {};
-    const std::size_t itemDefinitionCount = state::build_data::item_definition_count();
-    const std::size_t socketEntryListCount = state::build_data::socket_entry_list_count();
     state::build_data::items::Definition item{};
     state::build_data::items::details::Definition detail{};
     state::build_data::inventory::buckets::Descriptor bucket{};
     state::build_data::socket_entry_lists::Definition socketList{};
     if (profileItem.instanceSoid == 0 || profileItem.quantity <= 0 || profileItem.mutationSerial < 0
-        || itemDefinitionCount == 0
-        || itemDefinitionCount > state::build_data::items::kDefinitionCapacity
-        || socketEntryListCount == 0
-        || socketEntryListCount > state::build_data::socket_entry_lists::kDefinitionCapacity
         || !state::build_data::find_item_definition_hash(profileItem.definitionHash, item)
         || item.definitionHash != profileItem.definitionHash
         || !state::build_data::find_configured_item_detail(item.definitionIndex, detail)
@@ -106,16 +99,16 @@ bool resolve_profile_item_instance(const state::account::inventory::ProfileItem&
         || bucket.arraySelector != state::build_data::inventory::buckets::ArraySelector::profile
         || !state::build_data::is_profile_action_source(item.definitionIndex, item.bucketId)
         || !state::build_data::find_socket_entry_list(detail.socketEntryListIndex, socketList)
-        || socketList.definitionIndex != detail.socketEntryListIndex || socketList.entryCount != 0
-        || static_cast<std::size_t>(item.definitionIndex) >= itemDefinitionCount
-        || static_cast<std::size_t>(socketList.definitionIndex) >= socketEntryListCount) {
+        || socketList.definitionIndex != detail.socketEntryListIndex || socketList.entryCount != 0) {
         return false;
     }
 
     family4_datagen::instance::ResolvedInstance candidate{};
     candidate.instanceSoid = profileItem.instanceSoid;
-    candidate.bounds.itemDefinitionCount = static_cast<std::uint32_t>(itemDefinitionCount);
-    candidate.bounds.socketEntryListCount = static_cast<std::uint32_t>(socketEntryListCount);
+    candidate.bounds.itemDefinitionCount =
+        static_cast<std::uint32_t>(state::build_data::item_definition_count());
+    candidate.bounds.socketEntryListCount =
+        static_cast<std::uint32_t>(state::build_data::socket_entry_list_count());
     candidate.baseDefinitionIndex = item.definitionIndex;
     candidate.level = family4_datagen::instance::layout::kMinimumItemLevel;
     candidate.curveSelector = family4_datagen::instance::layout::kInitialLevelCurveX;
@@ -124,15 +117,10 @@ bool resolve_profile_item_instance(const state::account::inventory::ProfileItem&
     candidate.socketEntryCount = 0;
     candidate.socketEntryContentsResolved = true;
     candidate.ordinarySockets.state = family4_datagen::instance::OrdinarySocketBlockState::absent;
-    if (state::build_data::item_definition_count() != itemDefinitionCount
-        || state::build_data::socket_entry_list_count() != socketEntryListCount) {
-        return false;
-    }
     output = candidate;
     return true;
 }
 
-/** Appends every source-backed profile item after all character-owned item residents. */
 bool append_profile_items(Scratch& scratch,
                           std::span<std::byte> rawStorage,
                           std::uint32_t itemInstanceObjectId,
@@ -146,13 +134,13 @@ bool append_profile_items(Scratch& scratch,
         return false;
     }
     const auto encoded = rawStorage.first(family4_datagen::instance::layout::kObjectSize);
-    std::size_t appendedCount = 0;
-    for (std::size_t profileIndex = 0; profileIndex < account.profileItemCount; ++profileIndex) {
-        const state::account::inventory::ProfileItem& item = account.profileItems[profileIndex];
+    std::size_t appended = 0;
+    for (std::size_t index = 0; index < account.profileItemCount; ++index) {
+        const auto& item = account.profileItems[index];
         if (item.instanceSoid == 0) {
             continue;
         }
-        if (appendedCount >= state::account::inventory::kProfileActionSourceCapacity
+        if (appended >= state::account::inventory::kProfileActionSourceCapacity
             || baseIndex + itemCursor >= staged.objects.size()) {
             return false;
         }
@@ -168,7 +156,7 @@ bool append_profile_items(Scratch& scratch,
             return false;
         }
         ++itemCursor;
-        ++appendedCount;
+        ++appended;
     }
     return true;
 }

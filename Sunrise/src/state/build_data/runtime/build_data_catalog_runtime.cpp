@@ -2,19 +2,17 @@
 
 #include "../../content/content_catalog.h"
 #include "../abilities/ability_bucket_catalog.h"
-#include "../collectibles/collectible_catalog.h"
 #include "../constants/investment_constant_catalog.h"
+#include "../collectibles/collectible_catalog.h"
 #include "../hash_names/hash_name_catalog.h"
 #include "../inventory/buckets/inventory_bucket_catalog.h"
 #include "../items/details/item_detail_catalog.h"
 #include "../items/socket_plugs/socket_plug_catalog.h"
-#include "../material_requirements/material_requirement_catalog.h"
 #include "../progressions/progression_catalog.h"
 #include "../runtime.h"
 #include "../scenarios/scenario_catalog.h"
 #include "../socket_entry_lists/socket_entry_list_catalog.h"
 #include "../spawn_sets/spawn_set_catalog.h"
-#include "../vendors/vendor_catalog.h"
 #include "domain_markers.h"
 #include "persistence/publication_transaction.h"
 
@@ -101,11 +99,78 @@ bool publish_configured_item_details(
     return transaction.finish(true, rollback_detail_publication);
 }
 
+/** Extends configured details in memory after the immutable boot cache is complete. */
+bool extend_configured_item_details_runtime(
+    std::span<const items::details::Definition> definitions) noexcept {
+    return configured_item_details_ready() && !definitions.empty()
+           && valid_detail_publication(definitions) && items::details::merge(definitions);
+}
+
 /** Finds one configured item detail, once the whole table is in State. */
 bool find_configured_item_detail(std::uint16_t definitionIndex,
                                  items::details::Definition& definition) noexcept {
     definition = {};
     return configured_item_details_ready() && items::details::find(definitionIndex, definition);
+}
+
+/** Socket compatibility is transient: it is rebuilt from the installed packages each process. */
+bool socket_plug_rules_ready() noexcept {
+    return items::socket_plugs::rule_count() != 0;
+}
+
+bool publish_socket_plug_rules(std::span<const items::socket_plugs::Rule> rules,
+                               std::span<const items::socket_plugs::Pool> pools,
+                               std::span<const items::socket_plugs::Member> members) noexcept {
+    if (!item_definitions_ready() || !items::socket_plugs::valid(rules, pools, members)) {
+        return false;
+    }
+    const std::size_t itemCount = item_definition_count();
+    for (const auto& rule : rules) {
+        if (rule.itemDefinitionIndex >= itemCount) {
+            return false;
+        }
+    }
+    for (const auto member : members) {
+        if (member >= itemCount) {
+            return false;
+        }
+    }
+    return items::socket_plugs::replace(rules, pools, members);
+}
+
+bool is_socket_plug_allowed(std::uint16_t itemDefinitionIndex,
+                            std::uint8_t lane,
+                            std::uint16_t plugDefinitionIndex) noexcept {
+    return socket_plug_rules_ready()
+           && items::socket_plugs::allowed(itemDefinitionIndex, lane, plugDefinitionIndex);
+}
+
+bool socket_plug_candidates(std::uint16_t itemDefinitionIndex,
+                            std::uint8_t lane,
+                            std::span<items::socket_plugs::Member> output,
+                            std::size_t& count) noexcept {
+    count = 0;
+    return socket_plug_rules_ready()
+           && items::socket_plugs::pool_members(itemDefinitionIndex, lane, output, count);
+}
+
+bool is_profile_action_source(std::uint16_t itemDefinitionIndex, std::uint8_t bucketId) noexcept {
+    constexpr std::uint8_t kModBucketId = 13;
+    constexpr std::uint8_t kShaderBucketId = 14;
+    items::details::Definition detail{};
+    inventory::buckets::Descriptor bucket{};
+    if ((bucketId != kModBucketId && bucketId != kShaderBucketId)
+        || !find_configured_item_detail(itemDefinitionIndex, detail)
+        || detail.definitionIndex != itemDefinitionIndex || detail.bucketId != bucketId
+        || detail.instancedDefinitionState != items::details::InstancedDefinitionState::stackable
+        || !find_inventory_bucket_descriptor(bucketId, bucket)
+        || bucket.arraySelector != inventory::buckets::ArraySelector::profile) {
+        return false;
+    }
+    // Ownership is a bucket/schema property. Compatibility with a particular target socket is
+    // checked separately by the socket action, so an incomplete plug-pool extraction must not
+    // prevent the Client from owning a legitimate shader/mod source.
+    return true;
 }
 
 /** @return True when the whole progression definition table is in State. */
@@ -264,47 +329,17 @@ bool find_investment_constants(constants::InvestmentConstants& value) noexcept {
     return constants::find(value);
 }
 
-/** @return True when the installed vendor index is in State. */
-bool vendor_catalog_ready() noexcept {
-    return vendors::count() != 0;
-}
-
-/** Publishes the vendor index and every extracted vendor definition in one step. */
-bool publish_vendor_catalog(std::span<const vendors::IndexEntry> index,
-                            std::span<const vendors::Definition> definitions,
-                            std::span<const vendors::SaleRow> saleRows,
-                            std::span<const vendors::InstalledRow> installedRows) noexcept {
-    runtime::persistence::Transaction transaction;
-    return transaction.active()
-           && transaction.finish(vendors::replace(index, definitions, saleRows, installedRows),
-                                 vendors::clear);
-}
-
-/** Finds one vendor's index row. */
-bool find_vendor_index(std::uint32_t definitionHash, vendors::IndexEntry& entry) noexcept {
-    entry = {};
-    return vendor_catalog_ready() && vendors::find_hash(definitionHash, entry);
-}
-
-/** Finds one extracted vendor definition. */
-bool find_vendor_definition(std::uint32_t definitionHash,
-                            vendors::Definition& definition) noexcept {
-    definition = {};
-    return vendor_catalog_ready() && vendors::find(definitionHash, definition);
-}
-
 namespace runtime {
 
 /** Clears every generated catalog and the configured-domain publication state. */
 void clear_catalogs() noexcept {
     content::clear();
     named::clear();
-    items::clear();
     collectibles::clear();
-    material_requirements::clear();
+    items::clear();
     items::details::clear();
-    details::clear();
     items::socket_plugs::clear();
+    details::clear();
     inventory::buckets::clear();
     socket_entry_lists::clear();
     rollback_ability_publication();
@@ -312,7 +347,6 @@ void clear_catalogs() noexcept {
     scenarios::clear();
     rollback_spawn_catalog_publication();
     rollback_name_catalog_publication();
-    vendors::clear();
     constants::clear();
 }
 

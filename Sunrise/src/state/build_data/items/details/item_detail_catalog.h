@@ -26,6 +26,15 @@ void clear() noexcept;
 [[nodiscard]] bool replace(std::span<const Definition> definitions) noexcept;
 
 /**
+ * Adds missing validated detail rows without replacing the current runtime table.
+ * Existing native indices are left in place. This is for process-local editor expansion only;
+ * the persistent cache remains the boot snapshot and is rebuilt on the next matching identity.
+ * @param definitions Additional installed-build rows.
+ * @return True when every new row is valid and fits fixed storage.
+ */
+[[nodiscard]] bool merge(std::span<const Definition> definitions) noexcept;
+
+/**
  * Finds one configured item detail by native definition index.
  * @param definitionIndex Native installed-build item index.
  * @param definition Receives the matching configured item detail.

@@ -1,8 +1,6 @@
 #include <Windows.h>
 
 #include <algorithm>
-#include <array>
-#include <cstdio>
 
 #include "../../../core/logging/log.h"
 #include "../../../middleware/secure_channel/runtime.h"
@@ -11,7 +9,6 @@
 #include "activity_transaction/activity_transaction_notifications.h"
 #include "bap_connection_publication.h"
 #include "internal.h"
-#include "push/activity/activity_roster_push.h"
 #include "queuez/queuez_outcome_staging.h"
 #include "transactions/service_outcome_commit.h"
 
@@ -44,7 +41,6 @@ bool consume(Session& session,
              std::span<std::byte> response,
              std::size_t& written) noexcept {
     written = 0;
-    session.accountMutationPublished = false;
     if (!session.authenticated) {
         // Staying silent here looks the same as a decode fault, and both look like a dead link.
         core::log::write(core::log::Channel::server,
@@ -110,7 +106,7 @@ bool consume(Session& session,
         // good and every later reply is rejected, which is worse than a thin reply.
         clear_prefix(scratch.responseBody, responseBodySize);
         responseBodySize = 0;
-        outcome = {};
+        SecureZeroMemory(&outcome, sizeof outcome);
         handled = sendsReply;
     }
     if (handled && sendsReply) {
@@ -148,54 +144,20 @@ bool consume(Session& session,
             diagnostics::report_failure(frame.messageId, "stage");
         }
     }
-    const auto* activityPlan = transaction_if<activity_message::ActivityPlan>(outcome);
-    if (handled && activityPlan != nullptr) {
-        handled = route.responseMode == ResponseMode::uncorrelatedPush;
+    if (handled && outcome.hasActivityTransaction) {
+        const auto& activityPlan = outcome.activityPlan;
+        handled = route.responseMode == ResponseMode::uncorrelatedPush
+                  && activity_transaction::stage_notifications(session,
+                                                               scratch,
+                                                               activityPlan,
+                                                               bapState.sessionKey,
+                                                               nextSendNonce,
+                                                               scratch.framed,
+                                                               framedSize);
         if (!handled) {
-            diagnostics::report_failure(frame.messageId, "route");
-        } else if (!activity_transaction::stage_notifications(session,
-                                                              scratch,
-                                                              *activityPlan,
-                                                              bapState.sessionKey,
-                                                              nextSendNonce,
-                                                              scratch.framed,
-                                                              framedSize)) {
-            // The transaction still commits. A push that cannot be built is one lost message, and
-            // dropping the commit with it would strand the client's reported state for the session.
             diagnostics::report_failure(frame.messageId, "notify");
         }
     }
-    const bool mutatesAccount =
-        outcome.hasChangeCharacter || outcome.hasSelectCharacter
-        || transaction_if<EquipmentSwapTransaction>(outcome) != nullptr
-        || transaction_if<SocketPlugTransaction>(outcome) != nullptr
-        || transaction_if<ItemStateTransaction>(outcome) != nullptr
-        || transaction_if<ItemAcquisitionTransaction>(outcome) != nullptr
-        || transaction_if<ProfileItemAcquisitionTransaction>(outcome) != nullptr
-        || transaction_if<ItemDismantleTransaction>(outcome) != nullptr;
-    // State commits consume and clear their pending payloads. Retain only the small diagnostic
-    // fields needed after publication; QueueZ after-images stay owned by the transaction variant.
-    const auto* stagedSocket = transaction_if<SocketPlugTransaction>(outcome);
-    const std::uint8_t socketLane = stagedSocket == nullptr ? 0 : stagedSocket->pending.socketLane;
-    const std::uint16_t socketPlugDefinition =
-        stagedSocket == nullptr ? 0 : stagedSocket->pending.plugDefinitionIndex;
-    const std::uint8_t socketTargetBucket =
-        stagedSocket == nullptr ? 0 : stagedSocket->pending.targetBucketId;
-    const std::uint8_t socketPlugBucket =
-        stagedSocket == nullptr ? 0 : stagedSocket->pending.plugBucketId;
-    const auto* stagedItemState = transaction_if<ItemStateTransaction>(outcome);
-    const std::uint64_t itemStateInstance =
-        stagedItemState == nullptr ? 0 : stagedItemState->pending.targetInstanceSoid;
-    const std::uint32_t itemStateFlags =
-        stagedItemState == nullptr ? 0 : stagedItemState->pending.afterFlags;
-    const auto* stagedProfile = transaction_if<ProfileItemAcquisitionTransaction>(outcome);
-    const std::uint32_t profileDefinitionHash =
-        stagedProfile == nullptr ? 0 : stagedProfile->pending.acquiredDefinitionHash;
-    const std::int32_t profileQuantity =
-        stagedProfile == nullptr ? 0 : stagedProfile->pending.acquiredQuantity;
-    const bool profileActionSource =
-        stagedProfile != nullptr && stagedProfile->pending.actionSource;
-    const bool profileAppended = stagedProfile != nullptr && stagedProfile->pending.appended;
     // Committing the transaction clears the mutation the member key lives in, so the connection
     // fields are captured before the commit and published after it.
     const ConnectionFields connection = connection_fields(outcome);
@@ -211,146 +173,124 @@ bool consume(Session& session,
             // The caller copy finishes before connection fields are published.
             session.sendNonce = nextSendNonce;
             if (publishesQueuez) {
+                const std::uint64_t priorRoot = session.queuez.family4RootSoid;
+                const queuez::Family3Phase priorFamily3Phase = session.queuez.family3Phase;
                 session.queuez = nextQueuez;
+                if (session.queuez.family4RootSoid != priorRoot
+                    || session.queuez.family3Phase != priorFamily3Phase) {
+                    // A successful root/selection transition supersedes the targeted editor chain
+                    // with a fresh native publication. It is therefore also a valid checkpoint
+                    // boundary for runtime State that was waiting on that older chain.
+                    if (session.editorPersistencePending) {
+                        const bool saved = state::checkpoint_characters();
+                        core::log::write(core::log::Channel::server,
+                                         saved ? core::log::Level::info : core::log::Level::warn,
+                                         saved
+                                             ? "ev=queuez stage=editor_checkpoint result=ok reason=transition"
+                                             : "ev=queuez stage=editor_checkpoint result=fail reason=transition_disk_or_settings");
+                    }
+                    session.editorPersistencePending = false;
+                    session.editorRefreshFailed = false;
+                    session.editorFamily3Version = 0;
+                    session.profileRefreshInstanceSoid = 0;
+                    session.profileRefreshAddResident = false;
+                    session.profileRefreshPending = false;
+                    session.accountRefreshPending = false;
+                    session.inventoryAddInstanceSoid = 0;
+                    session.inventoryAddCharacterSoid = 0;
+                    session.inventoryAddRefreshPending = false;
+                    session.equipmentRefreshInstanceSoid = 0;
+                    session.equipmentRefreshCharacterSoid = 0;
+                    session.equipmentRefreshPending = false;
+                    session.socketRefreshInstanceSoid = 0;
+                    session.socketRefreshCharacterSoid = 0;
+                    session.socketRefreshIncludeCharacter = false;
+                    session.socketRefreshPending = false;
+                    session.createdCharacterRefreshSoid = 0;
+                    session.createdCharacterRefreshPending = false;
+                    session.createdCharacterSelectSoid = 0;
+                    session.createdCharacterSelectPending = false;
+                    session.characterRefreshPending = false;
+                    session.characterRefreshSoid = 0;
+                    session.rosterRefreshCharacterSoid = 0;
+                    session.rosterRefreshPending = false;
+                    session.rosterRefreshFromCreate = false;
+                    session.bannerRefreshCharacterSoid = 0;
+                    session.bannerRefreshPending = false;
+                }
+            }
+            if (queuezPublication.armsEquipmentMirrors
+                && queuezPublication.equipmentMirrorCharacterSoid != 0) {
+                const std::uint64_t characterSoid =
+                    queuezPublication.equipmentMirrorCharacterSoid;
+                session.rosterRefreshCharacterSoid = characterSoid;
+                session.rosterRefreshPending = true;
+                session.rosterRefreshFromCreate = false;
+                const std::uint64_t selected =
+                    state::account::selected_character_soid(state::account_snapshot());
+                session.bannerRefreshCharacterSoid =
+                    session.queuez.family0Active && selected == characterSoid
+                            && session.queuez.family0Character == characterSoid
+                        ? characterSoid
+                        : 0;
+                session.bannerRefreshPending = session.bannerRefreshCharacterSoid != 0;
+                session.editorPersistencePending = true;
+                session.editorRefreshFailed = false;
+            }
+            if (outcome.hasCharacterDeletion) {
+                // Family 4 has already stopped referring to the deleted member/items. Publish the
+                // compacted complete roster next; consume_frame can append this deferred Family-3
+                // notification in the same socket write immediately after the delete response.
+                session.rosterRefreshCharacterSoid = 0;
+                session.rosterRefreshPending = true;
+                session.rosterRefreshFromCreate = false;
+                session.bannerRefreshCharacterSoid = 0;
+                session.bannerRefreshPending = false;
+                session.editorPersistencePending = true;
+                session.editorRefreshFailed = false;
+                core::log::write(core::log::Channel::server,
+                                 core::log::Level::info,
+                                 "ev=queuez stage=character_delete3 result=armed");
+            }
+            if (outcome.hasSubscription
+                && outcome.subscription.familyType == queuez::kRosterFamilyType) {
+                // Explicit Family-3 subscriptions publish (or reset toward) the version-zero
+                // snapshot contract. The next editor mirror therefore starts at version one.
+                session.editorFamily3Version = 0;
+            }
+            if (outcome.hasCreatedCharacter && outcome.createdCharacterSoid != 0) {
+                // A cold create can establish the peer's complete version-zero roster/account
+                // ladder in the same response. Do not then append the same item's resident SOIDs
+                // again as a version-one addition.
+                if (queuezPublication.createdCharacterBootstrap) {
+                    session.createdCharacterSelectSoid = 0;
+                    session.createdCharacterSelectPending = false;
+                    core::log::write(core::log::Channel::server,
+                                     core::log::Level::info,
+                                     "ev=queuez stage=create_publish result=bootstrapped_selected");
+                } else if (session.queuez.family4Active && session.queuez.family4RootSoid != 0
+                           && session.queuez.family3Phase == queuez::Family3Phase::normal) {
+                    session.createdCharacterRefreshSoid = outcome.createdCharacterSoid;
+                    session.createdCharacterRefreshPending = true;
+                    session.createdCharacterSelectSoid = outcome.createdCharacterSoid;
+                    session.createdCharacterSelectPending = false;
+                    core::log::write(core::log::Channel::server,
+                                     core::log::Level::info,
+                                     "ev=queuez stage=create_publish result=armed");
+                } else {
+                    core::log::write(core::log::Channel::server,
+                                     core::log::Level::info,
+                                     "ev=queuez stage=create_publish result=deferred_to_snapshot");
+                }
             }
             arm_repushes(session, queuezPublication);
             publish_connection_fields(session, publication, connection);
-            // The caller copy is done, so what the staged roster body owes is settled here.
-            push::activity::commit_staged_roster(session);
-            session.accountMutationPublished = mutatesAccount;
-            if (transaction_if<EquipmentSwapTransaction>(outcome) != nullptr) {
-                std::array<char, core::log::kLineCapacity> line{};
-                const int count = std::snprintf(
-                    line.data(),
-                    line.size(),
-                    "ev=equip stage=output_publish result=ok framed_bytes=%zu queuez_published=%u "
-                    "family_version=%d family0_version=%d family3_version=%d",
-                    framedSize,
-                    static_cast<unsigned>(publishesQueuez),
-                    session.queuez.family4Version,
-                    session.queuez.family0Version,
-                    session.queuez.family3Version);
-                if (count > 0) {
-                    core::log::write(core::log::Channel::server,
-                                     core::log::Level::debug,
-                                     {line.data(), static_cast<std::size_t>(count)});
-                }
-            }
-            if (const auto* transaction = transaction_if<SocketPlugTransaction>(outcome)) {
-                std::array<char, core::log::kLineCapacity> line{};
-                const int count = std::snprintf(
-                    line.data(),
-                    line.size(),
-                    "ev=socket_plug stage=output_publish result=ok framed_bytes=%zu "
-                    "queuez_published=%u family_version=%d family0_version=%d "
-                    "family3_version=%d instance=0x%llX lane=%u "
-                    "plug_definition=%u target_bucket=%u plug_bucket=%u",
-                    framedSize,
-                    static_cast<unsigned>(publishesQueuez),
-                    session.queuez.family4Version,
-                    session.queuez.family0Version,
-                    session.queuez.family3Version,
-                    static_cast<unsigned long long>(transaction->update.targetInstanceSoid),
-                    static_cast<unsigned>(socketLane),
-                    static_cast<unsigned>(socketPlugDefinition),
-                    static_cast<unsigned>(socketTargetBucket),
-                    static_cast<unsigned>(socketPlugBucket));
-                if (count > 0) {
-                    core::log::write(core::log::Channel::server,
-                                     core::log::Level::debug,
-                                     {line.data(), static_cast<std::size_t>(count)});
-                }
-            }
-            if (const auto* transaction = transaction_if<ItemStateTransaction>(outcome)) {
-                std::array<char, core::log::kLineCapacity> line{};
-                const int count = std::snprintf(
-                    line.data(),
-                    line.size(),
-                    "ev=item_state stage=output_publish result=ok framed_bytes=%zu "
-                    "queuez_published=%u family_version=%d instance=0x%llX flags=0x%X",
-                    framedSize,
-                    static_cast<unsigned>(publishesQueuez),
-                    session.queuez.family4Version,
-                    static_cast<unsigned long long>(itemStateInstance),
-                    itemStateFlags);
-                if (count > 0) {
-                    core::log::write(core::log::Channel::server,
-                                     core::log::Level::debug,
-                                     {line.data(), static_cast<std::size_t>(count)});
-                }
-            }
-            if (const auto* transaction = transaction_if<ItemAcquisitionTransaction>(outcome)) {
-                std::array<char, core::log::kLineCapacity> line{};
-                const int count = std::snprintf(
-                    line.data(),
-                    line.size(),
-                    "ev=acquire stage=output_publish result=ok framed_bytes=%zu "
-                    "queuez_published=%u family_version=%d residents=%u instance=0x%llX",
-                    framedSize,
-                    static_cast<unsigned>(publishesQueuez),
-                    session.queuez.family4Version,
-                    static_cast<unsigned>(session.queuez.family4ResidentCount),
-                    static_cast<unsigned long long>(transaction->update.acquiredInstanceSoid));
-                if (count > 0) {
-                    core::log::write(core::log::Channel::server,
-                                     core::log::Level::debug,
-                                     {line.data(), static_cast<std::size_t>(count)});
-                }
-            }
-            if (const auto* transaction =
-                    transaction_if<ProfileItemAcquisitionTransaction>(outcome)) {
-                std::array<char, core::log::kLineCapacity> line{};
-                const int count = std::snprintf(
-                    line.data(),
-                    line.size(),
-                    "ev=profile_acquire stage=output_publish result=ok framed_bytes=%zu "
-                    "queuez_published=%u family_version=%d residents=%u definition_hash=0x%08X "
-                    "quantity=%d instance=0x%llX action_source=%u appended_row=%u "
-                    "appended_resident=%u",
-                    framedSize,
-                    static_cast<unsigned>(publishesQueuez),
-                    session.queuez.family4Version,
-                    static_cast<unsigned>(session.queuez.family4ResidentCount),
-                    profileDefinitionHash,
-                    profileQuantity,
-                    static_cast<unsigned long long>(transaction->update.acquiredInstanceSoid),
-                    static_cast<unsigned>(profileActionSource),
-                    static_cast<unsigned>(profileAppended),
-                    static_cast<unsigned>(transaction->update.appendedResident));
-                if (count > 0) {
-                    core::log::write(core::log::Channel::server,
-                                     core::log::Level::debug,
-                                     {line.data(), static_cast<std::size_t>(count)});
-                }
-            }
-            if (const auto* transaction = transaction_if<ItemDismantleTransaction>(outcome)) {
-                std::array<char, core::log::kLineCapacity> line{};
-                const int count = std::snprintf(
-                    line.data(),
-                    line.size(),
-                    "ev=dismantle stage=output_publish result=ok framed_bytes=%zu "
-                    "queuez_published=%u family_version=%d residents=%u instance=0x%llX",
-                    framedSize,
-                    static_cast<unsigned>(publishesQueuez),
-                    session.queuez.family4Version,
-                    static_cast<unsigned>(session.queuez.family4ResidentCount),
-                    static_cast<unsigned long long>(transaction->update.dismantledInstanceSoid));
-                if (count > 0) {
-                    core::log::write(core::log::Channel::server,
-                                     core::log::Level::debug,
-                                     {line.data(), static_cast<std::size_t>(count)});
-                }
-            }
         }
-    }
-    if (!handled) {
-        // The staged body is dropped, so its grant and its state byte go back for the next push.
-        push::activity::discard_staged_roster(session);
     }
     clear_prefix(scratch.plaintext, plaintextSize);
     clear_prefix(scratch.responseBody, responseBodySize);
     clear_prefix(scratch.framed, framedSize);
-    outcome = {};
+    SecureZeroMemory(&outcome, sizeof outcome);
     SecureZeroMemory(&publication, sizeof publication);
     SecureZeroMemory(&queuezPublication, sizeof queuezPublication);
     if (handled) {

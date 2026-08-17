@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 
 #include "definition_index_table.h"
@@ -58,7 +59,9 @@ read(std::span<const std::byte> blob, std::size_t offset, Value& value) noexcept
 }
 
 /**
- * Reads the gear-art index and every class-qualified arrangement the art block declares.
+ * Reads the two art indices the art block declares.
+ * The arrangement index comes from the block's first art row, so the row count must be checked.
+ * An art block with no rows would read arrangement zero, which is a real arrangement, not none.
  * @param definition Whole item definition bytes.
  * @param art Art block offset.
  * @param row Receives both art indices.

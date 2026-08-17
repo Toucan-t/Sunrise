@@ -2,37 +2,34 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 
 #include "../../../../state/build_data/runtime.h"
 
 namespace sunrise::client::content::items::packages {
 namespace {
 
-/** Sundial/native category families whose socket seed expands to every plug in that family. */
 constexpr std::array<std::uint32_t, 3> kExpandableCategories{
     0xB134761EU,
     0x87727F34U,
     0x6C863692U,
 };
-/** Tracker sockets synthesize these three safe plug choices by socket type. */
 constexpr std::array<std::uint32_t, 3> kTrackerPlugHashes{
     2'285'418'970U,
     2'302'094'943U,
     38'912'240U,
 };
-/** Native ordinary socket type whose choices are the synthetic tracker set. */
 constexpr std::uint16_t kTrackerSocketType = 518;
-/** FNV-1a constants make pool fingerprints stable and cheap. */
+/** Shadowkeep profile-inventory bucket containing shader action sources. */
+constexpr std::uint8_t kShaderBucketId = 14;
 constexpr std::uint64_t kHashOffsetBasis = 14695981039346656037ULL;
 constexpr std::uint64_t kHashPrime = 1099511628211ULL;
 
-/** Visitor adapter that appends one list member to a bounded lane candidate. */
 struct VisitorContext {
     SocketPlugBuild* build{};
     std::size_t itemDefinitionCount{};
 };
 
-/** @return Whether the package-provided member was accepted into bounded scratch. */
 [[nodiscard]] bool visit_member(void* opaque, std::uint32_t itemDefinitionIndex) noexcept {
     auto& context = *static_cast<VisitorContext*>(opaque);
     return context.build != nullptr
@@ -41,7 +38,6 @@ struct VisitorContext {
 
 } // namespace
 
-/** Returns the compact 1-based code of one native category-expansion family. */
 std::uint8_t special_plug_category(std::uint32_t categoryHash) noexcept {
     for (std::size_t index = 0; index < kExpandableCategories.size(); ++index) {
         if (kExpandableCategories[index] == categoryHash) {
@@ -51,7 +47,6 @@ std::uint8_t special_plug_category(std::uint32_t categoryHash) noexcept {
     return 0;
 }
 
-/** Allocates the bounded build state and indexes expansion/tracker plug definitions. */
 bool SocketPlugBuild::prepare(
     std::span<const std::uint8_t> specialCategories,
     std::span<const state::build_data::items::Definition> itemDefinitions) noexcept {
@@ -60,20 +55,42 @@ bool SocketPlugBuild::prepare(
         || itemDefinitions.size() > state::build_data::items::kDefinitionCapacity) {
         return false;
     }
-    rules_.assign(socket_plugs::kRuleCapacity, {});
-    pools_.assign(socket_plugs::kPoolCapacity, {});
-    members_.assign(socket_plugs::kMemberCapacity, {});
-    candidates_.assign(state::build_data::items::kDefinitionCapacity, {});
-    categoryMembers_.assign(kCategoryCount * state::build_data::items::kDefinitionCapacity, {});
-    lookup_.assign(kLookupCapacity, {});
+    rules_.reset(new (std::nothrow) socket_plugs::Rule[socket_plugs::kRuleCapacity]);
+    pools_.reset(new (std::nothrow) socket_plugs::Pool[socket_plugs::kPoolCapacity]);
+    members_.reset(new (std::nothrow) socket_plugs::Member[socket_plugs::kMemberCapacity]);
+    candidates_.reset(new (std::nothrow)
+                          socket_plugs::Member[state::build_data::items::kDefinitionCapacity]);
+    categoryMembers_.reset(
+        new (std::nothrow)
+            socket_plugs::Member[kCategoryCount * state::build_data::items::kDefinitionCapacity]);
+    shaderMembers_.reset(
+        new (std::nothrow) socket_plugs::Member[state::build_data::items::kDefinitionCapacity]);
+    lookup_.reset(new (std::nothrow) PoolLookup[kLookupCapacity]);
+    if (!rules_ || !pools_ || !members_ || !candidates_ || !categoryMembers_ || !shaderMembers_
+        || !lookup_) {
+        release();
+        return false;
+    }
     pools_[socket_plugs::kEmptyPoolIndex] = {};
     poolCount_ = 1;
     for (std::size_t item = 0; item < itemDefinitions.size(); ++item) {
-        const std::uint8_t category = specialCategories[item];
+        const auto nativeIndex = itemDefinitions[item].definitionIndex;
+        if (nativeIndex >= specialCategories.size()) {
+            release();
+            return false;
+        }
+        const std::uint8_t category = specialCategories[nativeIndex];
         if (category != 0 && category <= kCategoryCount) {
             const std::size_t family = category - 1;
             categoryMembers_[family * state::build_data::items::kDefinitionCapacity
-                             + categoryCounts_[family]++] = static_cast<std::uint16_t>(item);
+                             + categoryCounts_[family]++] = nativeIndex;
+        }
+        if (itemDefinitions[item].bucketId == kShaderBucketId) {
+            if (shaderCount_ >= state::build_data::items::kDefinitionCapacity) {
+                release();
+                return false;
+            }
+            shaderMembers_[shaderCount_++] = nativeIndex;
         }
         for (const std::uint32_t trackerHash : kTrackerPlugHashes) {
             if (itemDefinitions[item].definitionHash != trackerHash) {
@@ -83,16 +100,18 @@ bool SocketPlugBuild::prepare(
                 release();
                 return false;
             }
-            trackerMembers_[trackerCount_++] = static_cast<std::uint16_t>(item);
+            trackerMembers_[trackerCount_++] = nativeIndex;
         }
+    }
+    for (std::size_t i = 0; i < kLookupCapacity; ++i) {
+        lookup_[i].poolIndex = UINT32_MAX;
     }
     return true;
 }
 
-/** Appends one package member after enforcing the installed item-table bound. */
 bool SocketPlugBuild::add(std::uint32_t itemDefinitionIndex,
                           std::size_t itemDefinitionCount) noexcept {
-    if (candidates_.empty() || itemDefinitionIndex >= itemDefinitionCount
+    if (!candidates_ || itemDefinitionIndex >= itemDefinitionCount
         || itemDefinitionIndex >= state::build_data::items::kDefinitionCapacity
         || candidateCount_ >= state::build_data::items::kDefinitionCapacity) {
         return false;
@@ -101,20 +120,28 @@ bool SocketPlugBuild::add(std::uint32_t itemDefinitionIndex,
     return true;
 }
 
-/** Expands special category seeds, sorts/deduplicates, then interns one exact pool. */
-bool SocketPlugBuild::intern(std::uint32_t& poolIndex) noexcept {
+bool SocketPlugBuild::intern(std::uint32_t& poolIndex, bool forceShaderFamily) noexcept {
     poolIndex = socket_plugs::kEmptyPoolIndex;
-    if (candidates_.empty() || categoryMembers_.empty() || lookup_.empty()) {
+    if (!candidates_ || !categoryMembers_ || !lookup_) {
         return false;
     }
-    std::sort(candidates_.data(), candidates_.data() + candidateCount_);
+    std::sort(candidates_.get(), candidates_.get() + candidateCount_);
     candidateCount_ = static_cast<std::size_t>(
-        std::unique(candidates_.data(), candidates_.data() + candidateCount_) - candidates_.data());
+        std::unique(candidates_.get(), candidates_.get() + candidateCount_) - candidates_.get());
+    const bool expandShaders =
+        shaderCount_ != 0
+        && (forceShaderFamily
+            || std::any_of(candidates_.get(),
+                           candidates_.get() + candidateCount_,
+                           [this](socket_plugs::Member candidate) noexcept {
+                               return std::binary_search(shaderMembers_.get(),
+                                                         shaderMembers_.get() + shaderCount_,
+                                                         candidate);
+                           }));
     std::array<bool, kCategoryCount> expand{};
-    // Category codes were indexed by native item definition index during prepare().
     for (std::size_t family = 0; family < kCategoryCount; ++family) {
         const auto* familyMembers =
-            categoryMembers_.data() + family * state::build_data::items::kDefinitionCapacity;
+            categoryMembers_.get() + family * state::build_data::items::kDefinitionCapacity;
         for (std::size_t seed = 0; seed < candidateCount_ && !expand[family]; ++seed) {
             expand[family] = std::binary_search(
                 familyMembers, familyMembers + categoryCounts_[family], candidates_[seed]);
@@ -129,17 +156,26 @@ bool SocketPlugBuild::intern(std::uint32_t& poolIndex) noexcept {
             return false;
         }
         const auto* first =
-            categoryMembers_.data() + family * state::build_data::items::kDefinitionCapacity;
-        std::copy_n(first, categoryCounts_[family], candidates_.data() + candidateCount_);
+            categoryMembers_.get() + family * state::build_data::items::kDefinitionCapacity;
+        std::copy_n(first, categoryCounts_[family], candidates_.get() + candidateCount_);
         candidateCount_ += categoryCounts_[family];
     }
-    std::sort(candidates_.data(), candidates_.data() + candidateCount_);
+    // Some Shadowkeep shader definitions do not expose the category hash consistently. A lane
+    // that already names any shader seed is nevertheless the native shader action lane, and all
+    // profile-bucket-14 shaders are valid members of that global family.
+    if (expandShaders) {
+        if (shaderCount_ > state::build_data::items::kDefinitionCapacity - candidateCount_) {
+            return false;
+        }
+        std::copy_n(shaderMembers_.get(), shaderCount_, candidates_.get() + candidateCount_);
+        candidateCount_ += shaderCount_;
+    }
+    std::sort(candidates_.get(), candidates_.get() + candidateCount_);
     candidateCount_ = static_cast<std::size_t>(
-        std::unique(candidates_.data(), candidates_.data() + candidateCount_) - candidates_.data());
+        std::unique(candidates_.get(), candidates_.get() + candidateCount_) - candidates_.get());
     if (candidateCount_ == 0) {
         return true;
     }
-
     std::uint64_t fingerprint = kHashOffsetBasis;
     for (std::size_t member = 0; member < candidateCount_; ++member) {
         std::uint16_t value = candidates_[member];
@@ -163,7 +199,7 @@ bool SocketPlugBuild::intern(std::uint32_t& poolIndex) noexcept {
             poolIndex = static_cast<std::uint32_t>(poolCount_);
             pools_[poolCount_++] = {static_cast<std::uint32_t>(memberCount_),
                                     static_cast<std::uint32_t>(candidateCount_)};
-            std::copy_n(candidates_.data(), candidateCount_, members_.data() + memberCount_);
+            std::copy_n(candidates_.get(), candidateCount_, members_.get() + memberCount_);
             memberCount_ += candidateCount_;
             slot = {fingerprint, poolIndex};
             return true;
@@ -173,9 +209,9 @@ bool SocketPlugBuild::intern(std::uint32_t& poolIndex) noexcept {
         }
         const socket_plugs::Pool& pool = pools_[slot.poolIndex];
         if (pool.memberCount == candidateCount_
-            && std::equal(candidates_.data(),
-                          candidates_.data() + candidateCount_,
-                          members_.data() + pool.memberOffset)) {
+            && std::equal(candidates_.get(),
+                          candidates_.get() + candidateCount_,
+                          members_.get() + pool.memberOffset)) {
             poolIndex = slot.poolIndex;
             return true;
         }
@@ -183,12 +219,48 @@ bool SocketPlugBuild::intern(std::uint32_t& poolIndex) noexcept {
     return false;
 }
 
-/** Extracts every exact ordinary socket pool of one installed item definition. */
+/** Learns shader socket types before the exact pool pass so empty/default lanes still expand. */
+void SocketPlugBuild::observe_shader_socket_types(
+    const tables::items::Row& item,
+    std::span<const std::byte> itemDefinition,
+    std::span<const std::byte> plugSetTable,
+    std::size_t itemDefinitionCount) noexcept {
+    if (!candidates_ || !shaderMembers_ || shaderCount_ == 0
+        || item.definitionIndex >= itemDefinitionCount
+        || item.socketCount > socket_plugs::kLaneCapacity) {
+        return;
+    }
+    for (std::uint8_t lane = 0; lane < item.socketCount; ++lane) {
+        candidateCount_ = 0;
+        VisitorContext visitor{this, itemDefinitionCount};
+        bool valid = tables::items::visit_allowed_plugs(
+            itemDefinition, plugSetTable, lane, visit_member, &visitor);
+        if (valid && item.initialPlugs[lane] != tables::items::kUnavailablePlug) {
+            valid = add(item.initialPlugs[lane], itemDefinitionCount);
+        }
+        if (!valid || item.socketTypes[lane] == tables::items::kUnavailableSocketType) {
+            continue;
+        }
+        const bool containsShader =
+            std::any_of(candidates_.get(),
+                        candidates_.get() + candidateCount_,
+                        [this](socket_plugs::Member candidate) noexcept {
+                            return std::binary_search(shaderMembers_.get(),
+                                                      shaderMembers_.get() + shaderCount_,
+                                                      candidate);
+                        });
+        if (containsShader) {
+            shaderSocketTypes_.set(item.socketTypes[lane]);
+        }
+    }
+    candidateCount_ = 0;
+}
+
 bool SocketPlugBuild::append(const tables::items::Row& item,
                              std::span<const std::byte> itemDefinition,
                              std::span<const std::byte> plugSetTable,
                              std::size_t itemDefinitionCount) noexcept {
-    if (rules_.empty() || item.definitionIndex >= itemDefinitionCount
+    if (!rules_ || item.definitionIndex >= itemDefinitionCount
         || item.socketCount > socket_plugs::kLaneCapacity) {
         return false;
     }
@@ -206,8 +278,11 @@ bool SocketPlugBuild::append(const tables::items::Row& item,
                 laneValid = add(trackerMembers_[tracker], itemDefinitionCount);
             }
         }
+        const bool learnedShaderLane =
+            item.socketTypes[lane] != tables::items::kUnavailableSocketType
+            && shaderSocketTypes_.test(item.socketTypes[lane]);
         std::uint32_t poolIndex = socket_plugs::kEmptyPoolIndex;
-        laneValid = laneValid && intern(poolIndex);
+        laneValid = laneValid && intern(poolIndex, learnedShaderLane);
         if (!laneValid || ruleCount_ >= socket_plugs::kRuleCapacity) {
             ++skipped_;
             complete = false;
@@ -218,51 +293,34 @@ bool SocketPlugBuild::append(const tables::items::Row& item,
     return complete;
 }
 
-/** Publishes the bounded relation and releases all transient interning memory. */
 bool SocketPlugBuild::publish() noexcept {
     const bool published =
-        !rules_.empty() && !pools_.empty() && !members_.empty()
-        && state::build_data::publish_socket_plug_rules(std::span(rules_.data(), ruleCount_),
-                                                        std::span(pools_.data(), poolCount_),
-                                                        std::span(members_.data(), memberCount_));
+        rules_ && pools_ && members_
+        && state::build_data::publish_socket_plug_rules(std::span(rules_.get(), ruleCount_),
+                                                        std::span(pools_.get(), poolCount_),
+                                                        std::span(members_.get(), memberCount_));
     release();
     return published;
 }
 
-/** Reports how many lanes failed closed during extraction. */
-std::size_t SocketPlugBuild::skipped() const noexcept {
-    return skipped_;
-}
+std::size_t SocketPlugBuild::skipped() const noexcept { return skipped_; }
+std::size_t SocketPlugBuild::rule_count() const noexcept { return ruleCount_; }
+std::size_t SocketPlugBuild::pool_count() const noexcept { return poolCount_; }
+std::size_t SocketPlugBuild::member_count() const noexcept { return memberCount_; }
 
-std::size_t SocketPlugBuild::rule_count() const noexcept {
-    return ruleCount_;
-}
-
-std::size_t SocketPlugBuild::pool_count() const noexcept {
-    return poolCount_;
-}
-
-std::size_t SocketPlugBuild::member_count() const noexcept {
-    return memberCount_;
-}
-
-/** Drops all heap-backed extraction scratch and resets every count. */
 void SocketPlugBuild::release() noexcept {
-    rules_.clear();
-    rules_.shrink_to_fit();
-    pools_.clear();
-    pools_.shrink_to_fit();
-    members_.clear();
-    members_.shrink_to_fit();
-    candidates_.clear();
-    candidates_.shrink_to_fit();
-    categoryMembers_.clear();
-    categoryMembers_.shrink_to_fit();
-    lookup_.clear();
-    lookup_.shrink_to_fit();
+    rules_.reset();
+    pools_.reset();
+    members_.reset();
+    candidates_.reset();
+    categoryMembers_.reset();
+    shaderMembers_.reset();
+    lookup_.reset();
     categoryCounts_ = {};
+    shaderSocketTypes_.reset();
     trackerMembers_ = {};
     trackerCount_ = 0;
+    shaderCount_ = 0;
     ruleCount_ = 0;
     poolCount_ = 0;
     memberCount_ = 0;

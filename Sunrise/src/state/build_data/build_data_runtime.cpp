@@ -8,13 +8,10 @@
 #include "../content/content_catalog.h"
 #include "abilities/ability_bucket_catalog.h"
 #include "cache/internal.h"
-#include "collectibles/collectible_catalog.h"
 #include "constants/investment_constant_catalog.h"
 #include "hash_names/hash_name_catalog.h"
 #include "inventory/buckets/inventory_bucket_catalog.h"
 #include "items/details/item_detail_catalog.h"
-#include "items/socket_plugs/socket_plug_catalog.h"
-#include "material_requirements/material_requirement_catalog.h"
 #include "progressions/progression_catalog.h"
 #include "runtime.h"
 #include "runtime/build_data_catalog_runtime.h"
@@ -23,7 +20,6 @@
 #include "scenarios/scenario_catalog.h"
 #include "socket_entry_lists/socket_entry_list_catalog.h"
 #include "spawn_sets/spawn_set_catalog.h"
-#include "vendors/vendor_catalog.h"
 
 namespace sunrise::state::build_data {
 namespace {
@@ -70,14 +66,12 @@ bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept {
                     runtime::persistence::scratch_domains(persistenceState),
                     counts);
     if (status == cache::LoadStatus::missing) {
-        runtime::persistence::release_scratch_locked(persistenceState);
         ReleaseSRWLockExclusive(&persistenceState.lock);
         return true;
     }
     if (status == cache::LoadStatus::stale) {
         // A stale cache is replaced only after every domain is complete.
         persistenceState.replaceStaleCache = true;
-        runtime::persistence::release_scratch_locked(persistenceState);
         ReleaseSRWLockExclusive(&persistenceState.lock);
         return true;
     }
@@ -97,15 +91,11 @@ bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept {
     };
     if (status != cache::LoadStatus::loaded || !constants::replace(cachedConstants)
         || !content::replace(domains.named) || !content::seal() || !items::replace(domains.items)
-        || !collectibles::replace(domains.collectibles)
-        || !material_requirements::replace(domains.materialRequirementSets)
         || !inventory::buckets::replace(domains.inventoryBuckets)
         || !socket_entry_lists::replace(domains.socketEntryLists)
         // The per-entry tables are what the subclass selection reads. Without them a cache hit
         // makes the lists ready, the package build skips itself, and no ability is picked.
         || !socket_entry_lists::replace_entry_tables(domains.socketEntryTables) || !detailsReplaced
-        || !items::socket_plugs::replace(
-            domains.socketPlugRules, domains.socketPlugPools, domains.socketPlugMembers)
         || !abilities::replace(domains.abilityBuckets)
         || !progressions::replace(domains.progressions)
         // The layouts are what activity message 1 reads. Without them a cache hit makes the
@@ -114,12 +104,6 @@ bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept {
         // An empty catalog is complete, so the spawn-set replace is skipped rather than failed.
         || (!domains.spawnStems.empty()
             && !spawn_sets::replace(domains.spawnStems, domains.spawnNameHashes))
-        // An empty catalog is complete, so the vendor replace is skipped rather than failed.
-        || (!domains.vendorIndex.empty()
-            && !vendors::replace(domains.vendorIndex,
-                                 domains.vendorDefinitions,
-                                 domains.vendorSaleRows,
-                                 domains.vendorInstalledRows))
         || !hash_names::replace(domains.hashNames)) {
         // No domain remains published when any catalog rejects the cache transaction.
         runtime::clear_catalogs();
@@ -133,7 +117,6 @@ bool initialize(void* module, std::uint64_t configuredEquipmentHash) noexcept {
     runtime::spawn_catalog::publish();
     runtime::name_catalog::publish();
     persistenceState.persisted = true;
-    runtime::persistence::release_scratch_locked(persistenceState);
     ReleaseSRWLockExclusive(&persistenceState.lock);
     return true;
 }

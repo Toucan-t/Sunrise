@@ -4,8 +4,6 @@
 
 #include "../../../../../middleware/bap/activity_message/replicate_membership.h"
 #include "../../../../../middleware/secure_channel/runtime.h"
-#include "../../../../gameplay/gameplay_advertisement.h"
-#include "activity_arrival.h"
 #include "activity_notification_frame.h"
 
 namespace sunrise::server::bap::encrypted::push::activity {
@@ -13,19 +11,13 @@ namespace {
 
 namespace message = middleware::bap::activity_message::replicate_membership;
 
-/** The one published member always occupies slot zero of both top-level masks. */
-constexpr std::uint8_t kLocalMemberSlot = 0;
-
 /**
  * Maps a lock-consistent State snapshot into the fixed Middleware schema.
- * @param sessionId Joined activity session, used to resolve the advertised region.
- * @param mutation Prepared membership operation, whose region this body publishes.
+ * @param snapshot Prepared State data, checked again before it is published.
  * @return Whole current membership encoder input.
  */
 [[nodiscard]] message::MembershipSnapshot
-make_wire_snapshot(std::uint64_t sessionId,
-                   const state::activity::membership::PendingMutation& mutation) noexcept {
-    const state::activity::membership::Snapshot& snapshot = mutation.snapshot;
+make_wire_snapshot(const state::activity::membership::Snapshot& snapshot) noexcept {
     message::MembershipSnapshot wire{};
     wire.identity.memberKey = snapshot.identity.memberKey;
     wire.identity.field1 = snapshot.identity.smallOpaque;
@@ -44,14 +36,6 @@ make_wire_snapshot(std::uint64_t sessionId,
     wire.revision = snapshot.revision;
     wire.epoch = snapshot.epoch;
     wire.transitionToken = snapshot.transitionToken;
-    // The region this body is about to commit, not the one State still holds. Staging runs before
-    // the commit, so the region just left would leave the pending record empty for good.
-    const EffectiveRegion region = planned_region(mutation, sessionId);
-    server::gameplay::build_advertisement(region.index,
-                                          region.reported ? server::gameplay::RegionSource::reported
-                                                          : server::gameplay::RegionSource::arrival,
-                                          kLocalMemberSlot,
-                                          wire.citizen);
     return wire;
 }
 
@@ -72,7 +56,7 @@ bool append_membership_notification(Scratch& scratch,
     auto initialNonce = nonce;
     std::size_t messageSize = 0;
     const message::MembershipSnapshot snapshot =
-        make_wire_snapshot(activity.sessionId, activity.membershipMutation);
+        make_wire_snapshot(activity.membershipMutation.snapshot);
     const bool encoded =
         message::encode_replicate_membership(snapshot, scratch.responseBody, messageSize)
         && append_notification_frame(scratch,
@@ -83,7 +67,7 @@ bool append_membership_notification(Scratch& scratch,
                                      nonce,
                                      response,
                                      written);
-    SecureZeroMemory(scratch.responseBody.data(), message::encoded_size(snapshot));
+    SecureZeroMemory(scratch.responseBody.data(), message::kEncodedSize);
     if (encoded) {
         middleware::secure_channel::advance_nonce(nonce);
     } else {

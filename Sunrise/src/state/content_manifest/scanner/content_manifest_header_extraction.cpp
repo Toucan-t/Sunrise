@@ -50,7 +50,6 @@ void copy_row(const Candidate& candidate, Row& output) noexcept {
 /** Checks every listed header and emits one row per installed file. */
 bool extract(std::wstring_view directory,
              std::span<Candidate> candidates,
-             const Fingerprint& directoryFingerprint,
              std::span<Row> rows,
              std::size_t& count,
              Fingerprint& buildFingerprint,
@@ -93,8 +92,7 @@ bool extract(std::wstring_view directory,
         return std::string_view(first.name.data(), first.nameLength)
                < std::string_view(second.name.data(), second.nameLength);
     });
-    if (!valid(std::span<const Row>(occupied))
-        || !fingerprint::catalog(occupied, directoryFingerprint, buildFingerprint)) {
+    if (!valid(std::span<const Row>(occupied)) || !fingerprint::rows(occupied, buildFingerprint)) {
         count = 0;
         return false;
     }

@@ -27,8 +27,6 @@ struct Fold {
  * Records one material row, keeping insertion order and letting a later stage update a value.
  * A key arriving after 6 distinct keys are held can never reach the record, so it is dropped.
  * @param fold Ordered material keys.
- * @param key Material key this row names.
- * @param value Material value stored against that key.
  */
 void record(Fold& fold, std::int8_t key, std::uint16_t value) noexcept {
     for (std::size_t entry = 0; entry < fold.count; ++entry) {
@@ -110,8 +108,6 @@ void apply_plug_art(const Equipped& equipped,
             || !state::build_data::find_configured_item_detail(equipped.plugs[lane], plug)) {
             continue;
         }
-        // Shaders normally carry material rows only. Ornaments carry one or both art indices;
-        // the effective plug therefore replaces only the fields it actually declares.
         if (plug.gearArtIndex != details::kUnavailableArtIndex) {
             entry.art[layout::kGearArtSlot] = plug.gearArtIndex;
         }

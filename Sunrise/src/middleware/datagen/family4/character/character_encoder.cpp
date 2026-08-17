@@ -39,7 +39,6 @@ constexpr std::uint8_t kNativeFalse = 0;
 }
 
 /** One new-item flag byte covers 8 consecutive inventory rows. */
-constexpr std::size_t kBitsPerFlagByte = 8;
 /**
  * The watermark an occupied inventory row carries; an empty row keeps 0.
  * This is the character object's own per-row field, not the item instance's roll progress, so it
@@ -143,6 +142,30 @@ bool encode(const state::CharacterState& state,
     object.identity.race = static_cast<std::int8_t>(state.race);
     object.identity.gender = static_cast<std::int8_t>(state.gender);
     object.identity.characterClass = static_cast<std::int8_t>(state.characterClass);
+    const bool hasPresentationHeader =
+        std::any_of(state.presentationHeader.begin(),
+                    state.presentationHeader.end(),
+                    [](std::byte value) { return value != std::byte{}; });
+    const bool hasCreationHeader =
+        std::any_of(state.creationHeader.begin(),
+                    state.creationHeader.end(),
+                    [](std::byte value) { return value != std::byte{}; });
+    if (hasPresentationHeader) {
+        // Native-created characters prove this 36-byte block is sufficient to reconstruct the
+        // authored Guardian head on character-select. Inventory/orbit is the only remaining
+        // helmet-hidden path, so prefer the known-good presentation block in Family 4 as well.
+        // Keep the second creator block persisted separately until a traced consumer identifies it.
+        static_assert(state::kCharacterPresentationHeaderSize
+                      == state::kCharacterCreationHeaderSize);
+        std::memcpy(object.creationHeader.data(),
+                    state.presentationHeader.data(),
+                    state.presentationHeader.size());
+    } else if (hasCreationHeader) {
+        // Backward-compatible fallback for any store that has only the older provisional block.
+        std::memcpy(object.creationHeader.data(),
+                    state.creationHeader.data(),
+                    state.creationHeader.size());
+    }
     object.lastOrbitedDestination = state.lastOrbitedDestination;
     object.previewMirrors.fill(state.previewAvailable ? kNativeTrue : kNativeFalse);
     object.contentBypass = state.contentBypass ? kNativeTrue : kNativeFalse;
@@ -177,10 +200,9 @@ bool encode(const state::CharacterState& state,
         inventoryRow.quantity = item.quantity;
         inventoryRow.mutationSerial = item.mutationSerial;
         inventoryRow.flags = item.flags;
-        // Both companion arrays are indexed by inventory row, not by equipment slot, and the
-        // client's own producer marks every row it fills.
-        object.newItemFlags[item.inventoryRow / kBitsPerFlagByte] |=
-            std::byte{1U} << (item.inventoryRow % kBitsPerFlagByte);
+        // The progress watermark is persistent row state. New-item flags are transient action
+        // feedback and must not be reasserted by ordinary snapshots, or every owned item sparkles
+        // again after login/refresh. Acquisition staging marks only the newly created row.
         object.instanceProgressWatermarks[item.inventoryRow] = kOccupiedRowWatermark;
         if (item.equipped) {
             object.equippedInstanceSoids[item.equipmentSlot] = item.instance.instanceSoid;

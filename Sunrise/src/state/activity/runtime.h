@@ -1,11 +1,34 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 #include "definition.h"
 #include "entity_slots/runtime.h"
 
 namespace sunrise::state::activity {
+
+/**
+ * Latest joined activity context used by diagnostics that need to correlate authored data with
+ * the client's current host region. The highest joined session id wins because offline Sunrise
+ * allocates a new monotonic id for each later activity session.
+ */
+struct CurrentContext {
+    std::array<char, destination::kPackageNameCapacity> destination{};
+    std::uint8_t destinationLength{};
+    std::uint64_t sessionId{};
+    std::int32_t regionIndex{membership::kAbsentRegionIndex};
+    std::uint32_t regionHash{};
+    std::int32_t teleportSliceSetIndex{membership::kAbsentSliceSetIndex};
+};
+
+/**
+ * Captures the latest joined activity session without mutating State.
+ * @param output Cleared, then receives destination and membership-region context.
+ * @return True when at least one joined session exists.
+ */
+[[nodiscard]] bool current_context(CurrentContext& output) noexcept;
 
 /**
  * Prepares one allocation with State's fixed default destination, without changing State.
@@ -33,15 +56,6 @@ namespace sunrise::state::activity {
  * @return True when the allocation committed in one step.
  */
 [[nodiscard]] bool commit(PendingAllocation& allocation) noexcept;
-
-/**
- * Frees one committed activity-session record.
- * Nothing else clears one. A host that allocates per region must release them, or the table
- * fills and the oldest record is evicted.
- * @param sessionId Public activity session id from an earlier allocation.
- * @return True when a record held that id and is now free.
- */
-bool release_session(std::uint64_t sessionId) noexcept;
 
 /**
  * Tests whether a nonzero activity session id is still in the fixed-size table.
@@ -79,5 +93,30 @@ void note_world_phase(WorldPhase phase) noexcept;
 
 /** @return Milliseconds since the running load started, or zero when none is running. */
 [[nodiscard]] std::uint64_t world_transition_age() noexcept;
+
+/**
+ * Read-only activity values useful while correlating native runtime objects with the local host
+ * simulation. This is diagnostics only; it never grants, releases, or mutates activity state.
+ */
+struct RuntimeProbeSnapshot final {
+    CurrentContext context{};
+    std::uint64_t stateRevision{};
+    std::uint64_t recordRevision{};
+    std::uint64_t joinedRevision{};
+    entity_slots::LeaseMask heldEntitySlotMask{};
+    std::size_t heldEntitySlots{};
+    std::size_t firstHeldEntitySlot{entity_slots::kSlotCount};
+    std::size_t lastHeldEntitySlot{entity_slots::kSlotCount};
+    std::size_t grantedBubbles{};
+    std::uint16_t currentBubbleGrantToken{};
+    WorldPhase phase{WorldPhase::idle};
+};
+
+/**
+ * Captures the newest joined session plus its slot-lease and bubble-authority summary.
+ * @param output Cleared, then receives the current diagnostic snapshot.
+ * @return True when a joined activity session exists.
+ */
+[[nodiscard]] bool runtime_probe_snapshot(RuntimeProbeSnapshot& output) noexcept;
 
 } // namespace sunrise::state::activity

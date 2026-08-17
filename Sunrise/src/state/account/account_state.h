@@ -11,14 +11,6 @@ namespace sunrise::state {
 
 /** One account can own at most the 3 playable character slots. */
 inline constexpr std::size_t kCharacterCapacity = 3;
-/** A server-authored dismantle policy stays small but leaves room for build variants. */
-inline constexpr std::size_t kDismantleRewardPolicyCapacity = 8;
-
-/** One profile material credited when ordinary character gear is dismantled. */
-struct DismantleRewardPolicy {
-    std::uint32_t definitionHash{};
-    std::int32_t quantity{};
-};
 
 /** Stable character race values authored independently of package definition mappings. */
 enum class CharacterRace : std::uint8_t {
@@ -47,6 +39,13 @@ enum class CharacterClass : std::uint8_t {
     /** Wire value 2 is a Warlock character. */
     warlock = 2,
 };
+
+/** Native character-select presentation header decoded from character creation. */
+inline constexpr std::size_t kCharacterPresentationHeaderSize = 36;
+/** Opaque 36-byte creator block provisionally mapped to the Family-4 creation header. */
+inline constexpr std::size_t kCharacterCreationHeaderSize = 36;
+/** Opaque final creator block retained until its native consumer is identified. */
+inline constexpr std::size_t kCharacterCreationTailSize = 24;
 
 /** Default movement entry. Each subclass offers 3, as entries 4, 5 and 6 of its group. */
 inline constexpr std::uint8_t kDefaultMovementAbilityEntry = 4;
@@ -77,8 +76,17 @@ struct CharacterState {
     std::uint8_t level{};
     bool accepted{};
     bool previewAvailable{};
-    /** Authored scalar kept for the family-specific character presentation encoders. */
+    /** Authored scalar kept for compatibility with the existing settings schema. */
     float appearanceValue{};
+    /**
+     * Native presentation/customization ids for the Guardian head/body setup. A cleared block means
+     * the character predates native creator capture and the encoder uses the measured legacy block.
+     */
+    std::array<std::byte, kCharacterPresentationHeaderSize> presentationHeader{};
+    /** Exact native-width creator fields provisionally consumed by Family 4 for a new character. */
+    std::array<std::byte, kCharacterCreationHeaderSize> creationHeader{};
+    /** Final creator fields are persisted losslessly but are not published until traced. */
+    std::array<std::byte, kCharacterCreationTailSize> creationTail{};
     /** Compact default destination hash used until a later runtime selection replaces it. */
     std::uint32_t lastOrbitedDestination{};
     /** Server policy that arms content checks only with the matching family-5 flag. */
@@ -99,18 +107,15 @@ struct CharacterState {
     std::uint8_t classAbilityEntry{kDefaultClassAbilityEntry};
     /** Authored loadout keyed only by stable semantic equipment slots. */
     account::inventory::Equipment equipment;
-    /** Unequipped items routed into their installed character-inventory bucket ranges. */
+    /** Unequipped owned items routed into their installed character-inventory bucket ranges. */
     account::inventory::CharacterItems inventory;
-    /** Next row generation; equip transactions consume two values for the two moved items. */
+    /** Next row generation used by native inventory mutation ordering. */
     std::uint32_t nextInventorySerial{};
 };
 
 /** Account identity shared by backend object families. */
 struct AccountState {
     std::uint64_t primarySoid{};
-    /** Economy policy comes from configuration, never from item-specific runtime constants. */
-    std::array<DismantleRewardPolicy, kDismantleRewardPolicyCapacity> dismantleRewards{};
-    std::size_t dismantleRewardCount{};
     /** Account-wide currencies and materials, placed by bucket rather than by authored slot. */
     std::array<account::inventory::ProfileItem, account::inventory::kProfileItemCapacity>
         profileItems{};
@@ -124,19 +129,7 @@ namespace account {
 
 [[nodiscard]] bool valid(const AccountState& state) noexcept;
 
-/** Checks settings-authored State before runtime-only profile stack SOIDs are assigned. */
-[[nodiscard]] bool valid_authored(const AccountState& state) noexcept;
-
 [[nodiscard]] std::uint64_t selected_character_soid(const AccountState& state) noexcept;
-
-/**
- * Reports the character the family-zero banner pair names.
- * The pair is published before any pick. A refusal spends the family's only acceptance window,
- * so it falls back to the first character.
- * @param state Account snapshot read under the lock.
- * @return The character's SOID, or zero when the account owns none.
- */
-[[nodiscard]] std::uint64_t banner_character_soid(const AccountState& state) noexcept;
 
 } // namespace account
 

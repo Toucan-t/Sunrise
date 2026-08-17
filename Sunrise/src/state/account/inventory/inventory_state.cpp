@@ -45,6 +45,16 @@ std::optional<EquipmentSlot> slot_from_name(std::string_view name) noexcept {
     return std::nullopt;
 }
 
+/** Returns the stable configuration/display name for one semantic equipment slot. */
+std::string_view slot_name(EquipmentSlot slot) noexcept {
+    for (const SlotName& candidate : kSlotNames) {
+        if (candidate.slot == slot) {
+            return candidate.name;
+        }
+    }
+    return "unknown";
+}
+
 /** Checks the canonical socket policy and every authored plug hash. */
 bool valid(const Sockets& sockets) noexcept {
     if (sockets.plugCount > sockets.plugs.size()) {

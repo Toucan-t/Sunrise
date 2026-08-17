@@ -11,8 +11,6 @@ namespace sunrise::middleware::content::packages::tables::items {
 inline constexpr std::size_t kSocketCapacity = 12;
 /** All bits set marks a socket lane with no initial plug. */
 inline constexpr std::uint16_t kUnavailablePlug = 0xFFFF;
-/** All bits set marks an item definition with no insertion or enable requirement set. */
-inline constexpr std::uint16_t kUnavailableMaterialRequirementSetIndex = 0xFFFFU;
 
 /** Declared stat contributions one definition carries. Shipped rows stay far below this. */
 inline constexpr std::size_t kStatCapacity = 64;
@@ -51,17 +49,14 @@ struct Row {
     std::uint8_t socketCount{};
     std::uint16_t initialPlugs[kSocketCapacity]{};
     std::uint16_t socketTypes[kSocketCapacity]{};
-    /** Plug category used by a few native sockets to expand a seed into its whole safe family. */
+    /** Plug category used by native reusable socket-family expansion. */
     std::uint32_t plugCategoryHash{};
-    /** Native material sets used when this definition is inserted or enabled as a plug. */
-    std::uint16_t insertionMaterialRequirementSetIndex{kUnavailableMaterialRequirementSetIndex};
-    std::uint16_t enabledMaterialRequirementSetIndex{kUnavailableMaterialRequirementSetIndex};
     std::uint8_t statCount{};
     std::uint8_t statRows[kStatCapacity]{};
     std::int32_t statValues[kStatCapacity]{};
     /** Gear art definition index, read straight from the art block. */
     std::uint16_t gearArtIndex{kUnavailableArtIndex};
-    /** Generic, Titan, Hunter, and Warlock art arrangements declared by the art block. */
+    /** Art arrangement index, read from the art block's first art row. */
     std::uint16_t artArrangementIndices[kArtClassCapacity]{};
     std::uint8_t sandboxPerkCount{};
     std::uint16_t sandboxPerks[kSandboxPerkCapacity]{};
@@ -89,21 +84,7 @@ void read_appearance(std::span<const std::byte> definition, Row& row) noexcept;
 /** Visitor called for each native item-definition index an ordinary socket list names. */
 using AllowedPlugVisitor = bool (*)(void* context, std::uint32_t itemDefinitionIndex) noexcept;
 
-/**
- * Visits the embedded, reusable, and randomized plug-list members declared for one socket
- * lane.
- * The initial plug is a separate fixed field and is intentionally left to the caller.
- *
- * @param definition Whole base-item definition bytes.
- * @param plugSetTable Whole shared plug-set
- * definition table from investment-root slot 51.
- * @param lane Ordinary socket lane to inspect.
- *
- * @param visitor Required bounded consumer.
- * @param context Opaque consumer state.
- * @return
- * True when every referenced array is structurally valid and accepted by the visitor.
- */
+/** Visits embedded/reusable/randomized allowed plugs for one exact ordinary socket lane. */
 [[nodiscard]] bool visit_allowed_plugs(std::span<const std::byte> definition,
                                        std::span<const std::byte> plugSetTable,
                                        std::uint8_t lane,

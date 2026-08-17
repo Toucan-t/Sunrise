@@ -17,12 +17,7 @@ constexpr unsigned kPackageNameBias = 128;
 /** The most significant bit of a byte, where each packed field starts. */
 constexpr unsigned kHighBit = 0x80;
 
-/**
- * Writes one byte into bit-packed storage at a bit offset.
- * @param bits Storage large enough to hold the whole byte at that offset.
- * @param bitOffset First bit of the byte.
- * @param value Byte to write, most significant bit first.
- */
+/** Writes one byte into bit-packed storage at a bit offset. */
 void write_byte(std::span<std::byte> bits, std::size_t bitOffset, unsigned value) noexcept {
     for (std::size_t index = 0; index < kBitsPerByte; ++index) {
         const std::size_t bit = bitOffset + index;
@@ -34,12 +29,7 @@ void write_byte(std::span<std::byte> bits, std::size_t bitOffset, unsigned value
     }
 }
 
-/**
- * Rewrites the captured descriptor's package name with the forced one.
- * @param selection Committed destination holding the captured bits.
- * @param value Forced destination whose name replaces the captured one.
- * @return True when the whole 40-byte field sat inside the captured bits.
- */
+/** Rewrites the captured descriptor's package name with the forced one. */
 [[nodiscard]] bool rename_descriptor(destination::DestinationSelection& selection,
                                      const ForcedDestination& value) noexcept {
     const std::size_t nameBits = destination::kPackageNameCapacity * kBitsPerByte;
@@ -48,8 +38,6 @@ void write_byte(std::span<std::byte> bits, std::size_t bitOffset, unsigned value
         return false;
     }
     for (std::size_t index = 0; index < destination::kPackageNameCapacity; ++index) {
-        // Past the name the field is padding, and a biased zero decodes outside the name charset,
-        // which is what ends the name.
         const unsigned character = index < value.packageNameLength
                                        ? static_cast<unsigned char>(value.packageName[index])
                                        : 0U;
@@ -85,13 +73,6 @@ void clear() noexcept {
     AcquireSRWLockExclusive(&runtime::storage::g_stateLock);
     runtime::storage::g_state.activity.forced = {};
     ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
-}
-
-/** @return True while the stored selection is complete and its switch is on. */
-bool override_active() noexcept {
-    ForcedDestination value{};
-    snapshot(value);
-    return active(value);
 }
 
 /** Overwrites one committed destination with the forced one. */

@@ -1,7 +1,5 @@
 #include "service_outcome_commit.h"
 
-#include "../../../../core/logging/log.h"
-#include "../../../../state/activity/bubble_authority/runtime.h"
 #include "../../../../state/activity/runtime.h"
 #include "../../../../state/matchmaking/matchmaking_state.h"
 #include "../../../../state/runtime/runtime.h"
@@ -17,90 +15,67 @@ namespace sunrise::server::bap::encrypted::transactions {
  */
 bool commit(ServiceOutcome& outcome, Publication& publication) noexcept {
     publication = {};
-    if (auto* allocation = transaction_if<state::activity::PendingAllocation>(outcome)) {
-        const std::uint64_t sessionId = allocation->sessionId;
+    const unsigned mutationCount = static_cast<unsigned>(outcome.hasCharacterDeletion)
+                                   + static_cast<unsigned>(outcome.hasEquipmentMutation)
+                                   + static_cast<unsigned>(outcome.hasItemAcquisition)
+                                   + static_cast<unsigned>(outcome.hasProfileItemAcquisition)
+                                   + static_cast<unsigned>(outcome.hasItemDismantle)
+                                   + static_cast<unsigned>(outcome.hasProfileItemDismantle)
+                                   + static_cast<unsigned>(outcome.hasSocketMutation)
+                                   + static_cast<unsigned>(outcome.hasItemStateMutation)
+                                   + static_cast<unsigned>(outcome.hasActivitySessionAllocation)
+                                   + static_cast<unsigned>(outcome.hasActivityTransaction)
+                                   + static_cast<unsigned>(outcome.hasMatchmakingMutation);
+    // A service route may never combine independently versioned State transactions.
+    if (mutationCount > 1U) {
+        return false;
+    }
+    if (outcome.hasCharacterDeletion) {
+        return state::commit_character_deletion(outcome.characterDeletion);
+    }
+    if (outcome.hasEquipmentMutation) {
+        return state::commit_inventory_move(outcome.equipmentMutation);
+    }
+    if (outcome.hasItemAcquisition) {
+        return state::commit_item_acquisition(outcome.itemAcquisition);
+    }
+    if (outcome.hasProfileItemAcquisition) {
+        return state::commit_profile_item_acquisition(outcome.profileItemAcquisition);
+    }
+    if (outcome.hasItemDismantle) {
+        return state::commit_item_dismantle(outcome.itemDismantle);
+    }
+    if (outcome.hasProfileItemDismantle) {
+        return state::commit_profile_item_dismantle(outcome.profileItemDismantle);
+    }
+    if (outcome.hasSocketMutation) {
+        return state::commit_socket_plug(outcome.socketMutation);
+    }
+    if (outcome.hasItemStateMutation) {
+        return state::commit_item_state(outcome.itemStateMutation);
+    }
+    if (outcome.hasActivitySessionAllocation) {
+        const std::uint64_t sessionId = outcome.activitySessionAllocation.sessionId;
         if (sessionId == state::activity::kAbsentSessionId
-            || !state::activity::commit(*allocation)) {
+            || !state::activity::commit(outcome.activitySessionAllocation)) {
             return false;
         }
         publication.activitySessionId = sessionId;
         publication.hasActivitySessionBinding = true;
         return true;
     }
-    if (auto* plan = transaction_if<activity_message::ActivityPlan>(outcome)) {
-        if (plan->mutationDomain == activity_message::MutationDomain::entitySlots) {
-            if (!state::activity::entity_slots::commit(plan->entitySlotMutation)) {
-                return false;
-            }
-            // The keepalive only finds a link that is bound to a session. A link that allocated
-            // its own session carries the same id, so this rebinds it to itself.
-            if (plan->delivery == activity_message::Delivery::joinNotifications
-                && plan->sessionId != state::activity::kAbsentSessionId) {
-                publication.activitySessionId = plan->sessionId;
-                publication.hasActivitySessionBinding = true;
-                publication.activitySessionFromJoin = true;
-                // The join resets the client's roster container and the grant mirror with it.
-                // A kept grant leaves that container ungranted, which refuses its placed objects.
-                state::activity::bubble_authority::clear_grants(plan->sessionId);
-            }
-            return true;
+    if (outcome.hasActivityTransaction) {
+        if (outcome.activityPlan.mutationDomain == activity_message::MutationDomain::entitySlots) {
+            return state::activity::entity_slots::commit(outcome.activityPlan.entitySlotMutation);
         }
-        if (plan->mutationDomain == activity_message::MutationDomain::membership) {
-            return state::activity::membership::commit(plan->membershipMutation);
+        if (outcome.activityPlan.mutationDomain == activity_message::MutationDomain::membership) {
+            return state::activity::membership::commit(outcome.activityPlan.membershipMutation);
         }
         // The retained patch epoch is connection state, so it commits nothing here.
-        return plan->mutationDomain == activity_message::MutationDomain::patchEpoch;
+        return outcome.activityPlan.mutationDomain == activity_message::MutationDomain::patchEpoch;
     }
-    if (auto* mutation = transaction_if<state::matchmaking::PendingMutation>(outcome)) {
-        return state::matchmaking::commit(*mutation);
-    }
-    if (auto* transaction = transaction_if<EquipmentSwapTransaction>(outcome)) {
-        const bool committed = state::commit_equipment_swap(transaction->pending);
-        core::log::write(core::log::Channel::server,
-                         committed ? core::log::Level::debug : core::log::Level::warn,
-                         committed ? "ev=equip stage=transaction_commit result=ok"
-                                   : "ev=equip stage=transaction_commit result=fail");
-        return committed;
-    }
-    if (auto* transaction = transaction_if<ItemAcquisitionTransaction>(outcome)) {
-        const bool committed = state::commit_item_acquisition(transaction->pending);
-        core::log::write(core::log::Channel::server,
-                         committed ? core::log::Level::debug : core::log::Level::warn,
-                         committed ? "ev=acquire stage=transaction_commit result=ok"
-                                   : "ev=acquire stage=transaction_commit result=fail");
-        return committed;
-    }
-    if (auto* transaction = transaction_if<SocketPlugTransaction>(outcome)) {
-        const bool committed = state::commit_socket_plug(transaction->pending);
-        core::log::write(core::log::Channel::server,
-                         committed ? core::log::Level::debug : core::log::Level::warn,
-                         committed ? "ev=socket_plug stage=transaction_commit result=ok"
-                                   : "ev=socket_plug stage=transaction_commit result=fail");
-        return committed;
-    }
-    if (auto* transaction = transaction_if<ItemStateTransaction>(outcome)) {
-        const bool committed = state::commit_item_state(transaction->pending);
-        core::log::write(core::log::Channel::server,
-                         committed ? core::log::Level::debug : core::log::Level::warn,
-                         committed ? "ev=item_state stage=transaction_commit result=ok"
-                                   : "ev=item_state stage=transaction_commit result=fail");
-        return committed;
-    }
-    if (auto* transaction = transaction_if<ProfileItemAcquisitionTransaction>(outcome)) {
-        const bool committed = state::commit_profile_item_acquisition(transaction->pending);
-        core::log::write(core::log::Channel::server,
-                         committed ? core::log::Level::debug : core::log::Level::warn,
-                         committed ? "ev=profile_acquire stage=transaction_commit result=ok"
-                                   : "ev=profile_acquire stage=transaction_commit result=fail");
-        return committed;
-    }
-    if (auto* transaction = transaction_if<ItemDismantleTransaction>(outcome)) {
-        const bool committed = state::commit_item_dismantle(transaction->pending);
-        core::log::write(core::log::Channel::server,
-                         committed ? core::log::Level::debug : core::log::Level::warn,
-                         committed ? "ev=dismantle stage=transaction_commit result=ok"
-                                   : "ev=dismantle stage=transaction_commit result=fail");
-        return committed;
+    if (outcome.hasMatchmakingMutation) {
+        return state::matchmaking::commit(outcome.matchmakingMutation);
     }
     return true;
 }

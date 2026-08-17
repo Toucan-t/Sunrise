@@ -7,8 +7,6 @@
 #include <string_view>
 
 #include "../../../core/logging/log.h"
-#include "../../../core/settings/settings.h"
-#include "../../../state/activity/forced/activity_forced_destination.h"
 #include "../../hooking/detour.h"
 #include "internal.h"
 
@@ -88,11 +86,10 @@ std::atomic<unsigned> g_forced{0};
 }
 
 /**
- * Emits one decision event while the per-run budget lasts. Only a public bubble reaches here.
- * @param sliceSet Slice-set index whose bubble the reader called public.
- * @param forced True when the answer was replaced, false when the region stays public.
+ * Emits one forcing event while the per-run budget lasts.
+ * @param sliceSet Slice-set index whose bubble was reported private.
  */
-void report(std::uint32_t sliceSet, bool forced) noexcept {
+void report(std::uint32_t sliceSet) noexcept {
     // One atomic claim per line, so a concurrent transition cannot reuse a budget slot.
     if (g_forced.fetch_add(1, std::memory_order_relaxed) >= kMaxReports) {
         return;
@@ -100,8 +97,7 @@ void report(std::uint32_t sliceSet, bool forced) noexcept {
     std::array<char, kLineCapacity> line{};
     const int written = std::snprintf(line.data(),
                                       line.size(),
-                                      "ev=bootflow stage=region result=%s slice_set=%u",
-                                      forced ? "forced" : "public",
+                                      "ev=bootflow stage=region result=forced slice_set=%u",
                                       static_cast<unsigned>(sliceSet));
     if (written > 0) {
         core::log::write(core::log::Channel::client,
@@ -112,8 +108,8 @@ void report(std::uint32_t sliceSet, bool forced) noexcept {
 
 /**
  * Reports a bubble as private, for the region transition's own call only.
- * A public region holds its slice-set switch until a public activity host connects. The answer
- * is public unless `client.region_private` is on, or a destination is forced.
+ * The starter stores this result in the manager's public flag. A public region then holds its
+ * slice-set switch until a public activity host connects, which solo play never gets.
  * @return False on the starter's call, otherwise the reader's own answer.
  */
 __declspec(noinline) bool __fastcall reader(std::uint32_t sliceSet) noexcept {
@@ -129,11 +125,8 @@ __declspec(noinline) bool __fastcall reader(std::uint32_t sliceSet) noexcept {
     if (caller != g_returnSite.load(std::memory_order_acquire)) {
         return true;
     }
-    // No public host serves a forced destination, so that run waits forever. It must load solo.
-    const bool forced =
-        core::settings::get().client.regionPrivate || state::activity::forced::override_active();
-    report(sliceSet, forced);
-    return !forced;
+    report(sliceSet);
+    return false;
 }
 
 /** @param reason Key naming the step that failed. @return False, for a direct return. */

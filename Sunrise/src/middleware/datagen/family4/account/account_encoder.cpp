@@ -38,23 +38,10 @@ constexpr std::size_t kBucketIdentityCapacity = 256;
     // The dense item table already carries the bucket, so a profile item needs no detail record.
     // Only equipped items and their plugs have one.
     state::build_data::items::Definition definition{};
-    state::build_data::items::details::Definition detail{};
     state::build_data::inventory::buckets::Descriptor bucket{};
-    if (item.quantity <= 0 || item.mutationSerial < 0
-        || !state::build_data::find_item_definition_hash(item.definitionHash, definition)
-        || !state::build_data::find_configured_item_detail(definition.definitionIndex, detail)
-        || detail.definitionIndex != definition.definitionIndex
-        || detail.definitionHash != definition.definitionHash
-        || detail.bucketId != definition.bucketId
-        || detail.instancedDefinitionState
-               != state::build_data::items::details::InstancedDefinitionState::stackable
+    if (!state::build_data::find_item_definition_hash(item.definitionHash, definition)
         || !state::build_data::find_inventory_bucket_descriptor(definition.bucketId, bucket)
         || bucket.arraySelector != state::build_data::inventory::buckets::ArraySelector::profile) {
-        return false;
-    }
-    const bool actionSource = state::build_data::is_profile_action_source(
-        definition.definitionIndex, definition.bucketId);
-    if (actionSource != (item.instanceSoid != 0)) {
         return false;
     }
     const std::uint16_t used = taken[definition.bucketId];

@@ -37,6 +37,12 @@ std::size_t item_definition_count() noexcept {
     return items::count();
 }
 
+/** Copies the installed item table without exposing catalog storage. */
+bool snapshot_item_definitions(std::span<items::Definition> output, std::size_t& count) noexcept {
+    count = 0;
+    return item_definitions_ready() && items::snapshot(output, count);
+}
+
 /** @return Dense socket-entry-list row count, read under the lock. */
 std::size_t socket_entry_list_count() noexcept {
     return socket_entry_lists::count();

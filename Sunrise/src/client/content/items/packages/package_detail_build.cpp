@@ -2,8 +2,10 @@
 #include <array>
 #include <cstring>
 #include <optional>
+#include <utility>
 
 #include "../../../../state/account/account_state.h"
+#include "../../../../state/account/inventory/item_name_catalog.h"
 #include "../../../../state/runtime/runtime.h"
 #include "internal.h"
 
@@ -12,13 +14,32 @@ namespace {
 
 namespace domain = state::build_data::items::details;
 
+/** Equipment slot for each equippable inventory bucket. */
+constexpr std::array<std::pair<std::uint8_t, std::int8_t>, 16> kEquipmentSlotOfBucket{{
+    {16, 0},
+    {3, 1},
+    {4, 2},
+    {5, 4},
+    {6, 5},
+    {7, 6},
+    {0, 7},
+    {1, 8},
+    {2, 9},
+    {10, 10},
+    {9, 11},
+    {8, 12},
+    {27, 13},
+    {41, 14},
+    {17, 15},
+    {47, 17},
+}};
+
 /** @param bucketId Inventory bucket. @return Its equipment slot, or none when not equippable. */
 [[nodiscard]] std::optional<std::int8_t> equipment_slot(std::uint8_t bucketId) noexcept {
-    state::build_data::inventory::buckets::Descriptor descriptor{};
-    if (state::build_data::find_inventory_bucket_descriptor(bucketId, descriptor)
-        && descriptor.equipmentSlot
-               != state::build_data::inventory::buckets::kUnavailableEquipmentSlot) {
-        return descriptor.equipmentSlot;
+    for (const auto& entry : kEquipmentSlotOfBucket) {
+        if (entry.first == bucketId) {
+            return entry.second;
+        }
     }
     return std::nullopt;
 }
@@ -32,8 +53,7 @@ namespace domain = state::build_data::items::details;
     detail.maxStackSize = row.maxStackSize;
     detail.instancedDefinitionState = row.instanced ? domain::InstancedDefinitionState::instanced
                                                     : domain::InstancedDefinitionState::stackable;
-    detail.equipmentSlot =
-        row.equipmentSlot.has_value() ? row.equipmentSlot : equipment_slot(row.bucketId);
+    detail.equipmentSlot = equipment_slot(row.bucketId);
     detail.ordinarySocketState =
         row.hasSockets ? domain::OrdinarySocketState::present : domain::OrdinarySocketState::absent;
     detail.ordinarySocketCount = row.socketCount;
@@ -50,8 +70,9 @@ namespace domain = state::build_data::items::details;
     }
     detail.statCount = static_cast<std::uint8_t>(stats);
     detail.gearArtIndex = row.gearArtIndex;
-    for (std::size_t index = 0; index < detail.artArrangementIndices.size(); ++index) {
-        detail.artArrangementIndices[index] = row.artArrangementIndices[index];
+    detail.artArrangementIndex = row.artArrangementIndices[0];
+    for (std::size_t art = 0; art < detail.artArrangementIndices.size(); ++art) {
+        detail.artArrangementIndices[art] = row.artArrangementIndices[art];
     }
     const std::size_t perks = row.sandboxPerkCount < detail.sandboxPerks.size()
                                   ? row.sandboxPerkCount
@@ -84,46 +105,57 @@ constexpr std::size_t kCharacterStatRowOffsets[]{593, 594, 595, 622, 623, 624};
 
 } // namespace
 
-/** Collects the authored equipment and plug hashes every configured character names. */
+/** Collects template, active-roster, and tiny subclass-prefetch hash sets. */
 bool collect_authored_hashes(AuthoredHashes& output) noexcept {
     output = {};
-    const state::AccountState account = state::account_snapshot();
-    if (!state::account::valid(account)) {
+    const state::AccountState configured = state::configured_account_snapshot();
+    const state::AccountState active = state::account_snapshot();
+    if (!state::account::valid(configured) || !state::account::valid(active)) {
         return false;
     }
-    const auto append = [&output](const state::account::inventory::Item& item) noexcept {
-        if (output.count >= output.values.size()) {
-            return false;
-        }
-        output.values[output.count++] = item.definitionHash;
-        for (std::size_t lane = 0; lane < item.sockets.plugCount; ++lane) {
-            if (!item.sockets.plugs[lane].has_value()) {
-                continue;
+
+    const auto append_account = [&](const state::AccountState& account) -> bool {
+        for (std::size_t character = 0; character < account.characterCount; ++character) {
+            for (const auto& item : account.characters[character].equipment.slots) {
+                if (!item.has_value()) {
+                    continue;
+                }
+                if (output.count >= output.values.size()) {
+                    return false;
+                }
+                output.values[output.count++] = item->definitionHash;
+                for (std::size_t lane = 0; lane < item->sockets.plugCount; ++lane) {
+                    if (!item->sockets.plugs[lane].has_value()) {
+                        continue;
+                    }
+                    if (output.count >= output.values.size()) {
+                        return false;
+                    }
+                    output.values[output.count++] = *item->sockets.plugs[lane];
+                }
             }
-            if (output.count >= output.values.size()) {
-                return false;
-            }
-            output.values[output.count++] = *item.sockets.plugs[lane];
         }
         return true;
     };
-    for (std::size_t character = 0; character < account.characterCount; ++character) {
-        for (const auto& item : account.characters[character].equipment.slots) {
-            if (!item.has_value()) {
-                continue;
-            }
-            if (!append(*item)) {
-                return false;
-            }
-        }
-        const state::account::inventory::CharacterItems& inventory =
-            account.characters[character].inventory;
-        for (std::size_t item = 0; item < inventory.count; ++item) {
-            if (!append(inventory.values[item])) {
-                return false;
-            }
-        }
+
+    if (!append_account(configured) || !append_account(active)) {
+        return false;
     }
+
+    // Subclasses are the one intentionally tiny catalogue prefetch. Ability buckets are built at
+    // boot and need the subclass detail before an editor swap. Weapons and armour are resolved
+    // only when the user applies them, so the 1.7k-item catalogue never becomes a startup sweep.
+    for (const state::account::inventory::item_names::Option& option :
+         state::account::inventory::item_names::options()) {
+        if (option.slot != state::account::inventory::EquipmentSlot::subclass) {
+            continue;
+        }
+        if (output.count >= output.values.size()) {
+            return false;
+        }
+        output.values[output.count++] = option.definitionHash;
+    }
+
     const auto end = output.values.begin() + static_cast<std::ptrdiff_t>(output.count);
     std::sort(output.values.begin(), end);
     output.count =
@@ -138,77 +170,46 @@ bool authored(const AuthoredHashes& hashes, std::uint32_t hash) noexcept {
     return std::binary_search(begin, end, hash);
 }
 
-/** @return True when the row's bucket maps to a supported equipment slot. */
-bool equippable(const tables::items::Row& row) noexcept {
-    return row.equipmentSlot.has_value() || equipment_slot(row.bucketId).has_value();
-}
-
-/** Applies the bucket-definition equipment mapping and publishes the complete bucket table. */
-bool publish_buckets(Storage& storage) noexcept {
-    namespace buckets = state::build_data::inventory::buckets;
-    if (state::build_data::inventory_bucket_descriptors_ready()) {
-        return true;
-    }
-    if (storage.bucketCount == 0 || storage.bucketCount > storage.bucketRows.size()) {
+/** Adds one definition index to the requested set. */
+bool request(std::uint16_t definitionIndex,
+             std::span<std::uint16_t> requested,
+             std::size_t& count) noexcept {
+    if (count >= requested.size()) {
         return false;
     }
-    bool hasEquipmentSlot = false;
-    for (std::size_t index = 0; index < storage.bucketCount; ++index) {
-        buckets::Descriptor& descriptor = storage.bucketRows[index];
-        descriptor.equipmentSlot = storage.equipmentSlotByBucket[descriptor.bucketId];
-        hasEquipmentSlot =
-            hasEquipmentSlot || descriptor.equipmentSlot != buckets::kUnavailableEquipmentSlot;
-    }
-    return hasEquipmentSlot
-           && state::build_data::publish_inventory_bucket_descriptors(
-               std::span(storage.bucketRows).first(storage.bucketCount));
-}
-
-/** Adds one definition index to the deduplicated requested set. */
-void request(std::uint16_t definitionIndex, DetailRequests& requested) noexcept {
-    if (static_cast<std::size_t>(definitionIndex) < requested.size()) {
-        requested.set(definitionIndex);
-    }
+    requested[count++] = definitionIndex;
+    return true;
 }
 
 /** Adds every socket lane's initial plug to the requested set. */
-void append_initial_plugs(const tables::items::Row& row,
-                          std::uint64_t itemDefinitionCount,
-                          DetailRequests& requested) noexcept {
-    for (std::size_t lane = 0; lane < row.socketCount; ++lane) {
-        if (row.initialPlugs[lane] == tables::items::kUnavailablePlug
-            || row.initialPlugs[lane] >= itemDefinitionCount) {
-            continue;
-        }
-        request(row.initialPlugs[lane], requested);
-    }
-}
-
-/** Materializes requested native indices in ascending order. */
-bool materialize_requests(const DetailRequests& requested,
-                          std::span<std::uint16_t> output,
+bool append_initial_plugs(const tables::items::Row& row,
+                          std::span<std::uint16_t> requested,
                           std::size_t& count) noexcept {
-    count = 0;
-    for (std::size_t index = 0; index < requested.size(); ++index) {
-        if (!requested.test(index)) {
+    for (std::size_t lane = 0; lane < row.socketCount; ++lane) {
+        if (row.initialPlugs[lane] == tables::items::kUnavailablePlug) {
             continue;
         }
-        if (count >= output.size()) {
-            count = 0;
+        if (!request(row.initialPlugs[lane], requested, count)) {
             return false;
         }
-        output[count++] = static_cast<std::uint16_t>(index);
     }
     return true;
+}
+
+/** @param requested Requested-set storage. @param count Sorted and deduplicated in place. */
+void compact_requested(std::span<std::uint16_t> requested, std::size_t& count) noexcept {
+    auto end = requested.begin() + static_cast<std::ptrdiff_t>(count);
+    std::sort(requested.begin(), end);
+    end = std::unique(requested.begin(), end);
+    count = static_cast<std::size_t>(end - requested.begin());
 }
 
 /** Reads one requested definition and turns it into its cached detail form. */
 bool build_detail(const DetailSource& source,
                   std::uint16_t definitionIndex,
-                  domain::Definition& detail,
-                  tables::items::Row& item) noexcept {
+                  domain::Definition& detail) noexcept {
     tables::IndexRow indexRow{};
-    item = {};
+    tables::items::Row item{};
     item.definitionIndex = definitionIndex;
     if (!tables::index_row(source.table, source.array, definitionIndex, indexRow)
         || !reader::read_tag(

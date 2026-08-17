@@ -4,9 +4,15 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string_view>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 #include "../../../../core/logging/log.h"
+#include "../../../../state/runtime/runtime.h"
 #include "../../../hooking/detour.h"
 #include "internal.h"
 
@@ -50,6 +56,23 @@ std::atomic<Family4Lookup> g_originalFamily4Lookup{nullptr};
 std::atomic_bool g_rebuildArmed{false};
 std::atomic_bool g_reportedRebuild{false};
 std::atomic_bool g_reportedFamily4{false};
+std::atomic_bool g_reportedFamily4Miss{false};
+std::atomic_uint32_t g_lookupTraceBudget{0};
+constexpr std::uint32_t kLookupTraceSamples = 48;
+
+/** Consumes one trace token without ever underflowing the atomic budget. */
+[[nodiscard]] bool take_trace_sample() noexcept {
+    std::uint32_t current = g_lookupTraceBudget.load(std::memory_order_relaxed);
+    while (current != 0) {
+        if (g_lookupTraceBudget.compare_exchange_weak(current,
+                                                      current - 1,
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /** @return True while either primary rebuild detour is attached. */
 [[nodiscard]] bool any_primary_attached() noexcept {
@@ -63,6 +86,8 @@ void clear_runtime() noexcept {
     g_rebuildArmed.store(false, std::memory_order_release);
     g_reportedRebuild.store(false, std::memory_order_release);
     g_reportedFamily4.store(false, std::memory_order_release);
+    g_reportedFamily4Miss.store(false, std::memory_order_release);
+    g_lookupTraceBudget.store(0, std::memory_order_release);
 }
 
 /**
@@ -91,11 +116,57 @@ __declspec(noinline) char __fastcall freshness(void* accessor) noexcept {
 __declspec(noinline) void* __fastcall family4_lookup(std::uint64_t* key) noexcept {
     const Family4Lookup original = g_originalFamily4Lookup.load(std::memory_order_acquire);
     void* const resolved = original != nullptr ? original(key) : nullptr;
+    if (resolved == nullptr && !g_reportedFamily4Miss.exchange(true, std::memory_order_relaxed)) {
+        const std::uint64_t selected =
+            state::account::selected_character_soid(state::account_snapshot());
+        std::array<char, 128> line{};
+        const int count = std::snprintf(line.data(),
+                                        line.size(),
+                                        "ev=investment stage=family4 result=miss selected=0x%llX",
+                                        static_cast<unsigned long long>(selected));
+        if (count > 0) {
+            core::log::write(core::log::Channel::client,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(count)});
+        }
+    }
     if (resolved != nullptr && !g_reportedFamily4.exchange(true, std::memory_order_relaxed)) {
         arm_derived_rebuild();
-        core::log::write(core::log::Channel::client,
-                         core::log::Level::info,
-                         "ev=investment stage=family4 result=resolved");
+        const std::uint64_t selected =
+            state::account::selected_character_soid(state::account_snapshot());
+        std::array<char, 128> line{};
+        const int count = std::snprintf(line.data(),
+                                        line.size(),
+                                        "ev=investment stage=family4 result=resolved selected=0x%llX",
+                                        static_cast<unsigned long long>(selected));
+        if (count > 0) {
+            core::log::write(core::log::Channel::client,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(count)});
+        }
+    }
+    if (take_trace_sample()) {
+        const std::uint64_t lookupKey = key != nullptr ? *key : 0;
+        const std::uint64_t selected =
+            state::account::selected_character_soid(state::account_snapshot());
+#if defined(_MSC_VER)
+        void* const caller = _ReturnAddress();
+#else
+        void* const caller = __builtin_return_address(0);
+#endif
+        std::array<char, 192> line{};
+        const int count = std::snprintf(line.data(),
+                                        line.size(),
+                                        "ev=investment stage=family4_trace result=%s key=0x%llX selected=0x%llX caller=%p",
+                                        resolved != nullptr ? "hit" : "miss",
+                                        static_cast<unsigned long long>(lookupKey),
+                                        static_cast<unsigned long long>(selected),
+                                        caller);
+        if (count > 0) {
+            core::log::write(core::log::Channel::client,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(count)});
+        }
     }
     return resolved;
 }
@@ -105,6 +176,14 @@ __declspec(noinline) void* __fastcall family4_lookup(std::uint64_t* key) noexcep
 /** Arms one derived-state rebuild, used up by the next freshness verdict. */
 void arm_derived_rebuild() noexcept {
     g_rebuildArmed.store(true, std::memory_order_release);
+}
+
+/** Arms a finite lookup trace so inventory/head diagnostics cannot flood the normal log. */
+void arm_family4_lookup_trace() noexcept {
+    g_lookupTraceBudget.store(kLookupTraceSamples, std::memory_order_release);
+    core::log::write(core::log::Channel::client,
+                     core::log::Level::info,
+                     "ev=investment stage=family4_trace result=armed samples=48");
 }
 
 /** @return True when freshness and both real-arrival rebuild arms are attached. */

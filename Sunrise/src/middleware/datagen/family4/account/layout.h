@@ -179,12 +179,9 @@ static_assert(offsetof(Object, characterUnlocks) == kCharacterUnlocksOffset);
 static_assert(offsetof(Object, profileUnlockFlags) == kProfileUnlockFlagsOffset);
 static_assert(sizeof(CharacterUnlockBlock)
               == kCharacterFlagCapacity + kCharacterValueCapacity * sizeof(std::int32_t));
-static_assert(sizeof(ProfileInventoryChangeRecord)
-              == 3 * sizeof(std::uint16_t) + sizeof(std::int32_t) + 2 * sizeof(std::uint8_t));
+static_assert(sizeof(ProfileInventoryChangeRecord) == 12);
 static_assert(sizeof(ProfileInventoryChangeList)
-              == 2 * sizeof(std::uint16_t)
-                     + kProfileInventoryChangeRecordCapacity
-                           * sizeof(ProfileInventoryChangeRecord));
+              == 4 + kProfileInventoryChangeRecordCapacity * sizeof(ProfileInventoryChangeRecord));
 static_assert(std::is_standard_layout_v<Object>);
 static_assert(std::is_trivially_copyable_v<Object>);
 

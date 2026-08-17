@@ -11,6 +11,8 @@
 
 #include "../../core/logging/log.h"
 #include "../../core/settings/settings.h"
+#include "../account/characters/character_store.h"
+#include "../account/inventory/item_name_catalog.h"
 #include "../activity/defaults/activity_defaults_validation.h"
 #include "../build_data/runtime.h"
 #include "equipment/configured_equipment_identity.h"
@@ -50,122 +52,6 @@ template <std::size_t Size>
            >= 0;
 }
 
-/** @return True when any authored or already-seeded account identity owns one SOID. */
-[[nodiscard]] bool identity_uses_soid(const AccountState& accountState,
-                                      std::uint64_t soid) noexcept {
-    if (soid == 0 || accountState.primarySoid == soid) {
-        return true;
-    }
-    for (std::size_t index = 0; index < accountState.profileItemCount; ++index) {
-        if (accountState.profileItems[index].instanceSoid == soid) {
-            return true;
-        }
-    }
-    for (std::size_t characterIndex = 0; characterIndex < accountState.characterCount;
-         ++characterIndex) {
-        const CharacterState& character = accountState.characters[characterIndex];
-        if (character.soid == soid) {
-            return true;
-        }
-        for (const std::optional<account::inventory::Item>& item : character.equipment.slots) {
-            if (item.has_value() && item->instanceSoid == soid) {
-                return true;
-            }
-        }
-        for (std::size_t index = 0; index < character.inventory.count; ++index) {
-            if (character.inventory.values[index].instanceSoid == soid) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-/** Seeds canonical character row generations before installed build data is needed. */
-[[nodiscard]] bool seed_inventory_runtime_fields(AccountState& accountState) noexcept {
-    if (!account::valid_authored(accountState)) {
-        return false;
-    }
-    for (std::size_t characterIndex = 0; characterIndex < accountState.characterCount;
-         ++characterIndex) {
-        CharacterState& character = accountState.characters[characterIndex];
-        std::uint32_t next = 0;
-        for (std::optional<account::inventory::Item>& item : character.equipment.slots) {
-            if (item.has_value()) {
-                item->mutationSerial = static_cast<std::int32_t>(next++);
-            }
-        }
-        for (std::size_t index = 0; index < character.inventory.count; ++index) {
-            character.inventory.values[index].mutationSerial = static_cast<std::int32_t>(next++);
-        }
-        character.nextInventorySerial = next;
-    }
-    return account::valid(accountState);
-}
-
-/**
- * Canonicalizes only profile rows which the installed socket UI materializes as action sources.
- * @param accountState Account canonicalized in place.
- * @return True when every profile row canonicalizes.
- */
-[[nodiscard]] bool canonicalize_profile_item_identities(AccountState& accountState) noexcept {
-    if (!account::valid(accountState) || !build_data::socket_plug_rules_ready()) {
-        return false;
-    }
-    std::array<bool, account::inventory::kProfileItemCapacity> actionSources{};
-    std::size_t actionSourceCount = 0;
-    for (std::size_t index = 0; index < accountState.profileItemCount; ++index) {
-        const account::inventory::ProfileItem& profileItem = accountState.profileItems[index];
-        build_data::items::Definition item{};
-        build_data::items::details::Definition detail{};
-        build_data::inventory::buckets::Descriptor bucket{};
-        if (!build_data::find_item_definition_hash(profileItem.definitionHash, item)
-            || item.definitionHash != profileItem.definitionHash
-            || !build_data::find_configured_item_detail(item.definitionIndex, detail)
-            || detail.definitionIndex != item.definitionIndex
-            || detail.definitionHash != item.definitionHash || detail.bucketId != item.bucketId
-            || detail.instancedDefinitionState
-                   != build_data::items::details::InstancedDefinitionState::stackable
-            || !build_data::find_inventory_bucket_descriptor(item.bucketId, bucket)
-            || bucket.arraySelector != build_data::inventory::buckets::ArraySelector::profile) {
-            return false;
-        }
-        actionSources[index] =
-            build_data::is_profile_action_source(item.definitionIndex, item.bucketId);
-        if (actionSources[index]
-            && ++actionSourceCount > account::inventory::kProfileActionSourceCapacity) {
-            return false;
-        }
-    }
-
-    // Currency, material, and consumable rows are native non-instanced stacks.  Clear any stale
-    // runtime key before allocating action-source identities so it cannot reserve the namespace.
-    for (std::size_t index = 0; index < accountState.profileItemCount; ++index) {
-        if (!actionSources[index]) {
-            accountState.profileItems[index].instanceSoid = 0;
-        }
-    }
-
-    std::uint64_t nextProfileSoid = account::inventory::kFirstProfileItemInstanceSoid;
-    for (std::size_t index = 0; index < accountState.profileItemCount; ++index) {
-        account::inventory::ProfileItem& item = accountState.profileItems[index];
-        if (!actionSources[index] || item.instanceSoid != 0) {
-            continue;
-        }
-        while (identity_uses_soid(accountState, nextProfileSoid)) {
-            if (nextProfileSoid == (std::numeric_limits<std::uint64_t>::max)()) {
-                return false;
-            }
-            ++nextProfileSoid;
-        }
-        item.instanceSoid = nextProfileSoid;
-        if (nextProfileSoid != (std::numeric_limits<std::uint64_t>::max)()) {
-            ++nextProfileSoid;
-        }
-    }
-    return account::valid(accountState);
-}
-
 } // namespace
 
 /**
@@ -188,20 +74,23 @@ bool initialize(void* module, const AccountState& initialAccount) noexcept {
 bool initialize(void* module,
                 const AccountState& initialAccount,
                 const activity::defaults::ActivityDefaults& activityDefaults) noexcept {
-    AccountState runtimeAccount = initialAccount;
-    if (!seed_inventory_runtime_fields(runtimeAccount)
-        || !activity::defaults::valid(activityDefaults)) {
+    if (!account::valid(initialAccount) || !activity::defaults::valid(activityDefaults)) {
         return false;
     }
-    if (!build_data::initialize(module, runtime::equipment::configured_hash(runtimeAccount))) {
+    AccountState activeAccount{};
+    account::characters::initialize(module, initialAccount, activeAccount);
+    if (!account::valid(activeAccount)) {
+        account::characters::shutdown();
         return false;
     }
-    // A cache hit already has the complete plug relation, so publish canonical profile identities
-    // in the first State image.  On a first cache build, snapshot preparation repeats this step
-    // after package extraction has published the relation.
-    if (build_data::socket_plug_rules_ready()
-        && !canonicalize_profile_item_identities(runtimeAccount)) {
-        build_data::shutdown();
+    // The item-name catalogue is optional display/search metadata. Native build-data identity is
+    // driven only by settings templates plus the persisted active roster, never by items.js.
+    account::inventory::item_names::initialize(module);
+    const AccountState configuredAccount = account::characters::configured_account();
+    if (!build_data::initialize(
+            module, runtime::equipment::configured_hash(configuredAccount, activeAccount))) {
+        account::inventory::item_names::shutdown();
+        account::characters::shutdown();
         return false;
     }
     {
@@ -211,8 +100,8 @@ bool initialize(void* module,
             std::snprintf(line.data(),
                           line.size(),
                           "ev=account stage=identity primary=0x%016llX characters=%zu",
-                          static_cast<unsigned long long>(runtimeAccount.primarySoid),
-                          runtimeAccount.characterCount);
+                          static_cast<unsigned long long>(activeAccount.primarySoid),
+                          activeAccount.characterCount);
         if (written > 0) {
             core::log::write(core::log::Channel::state,
                              core::log::Level::info,
@@ -226,13 +115,15 @@ bool initialize(void* module,
         || !randomize(initialized.bap.sessionKey) || !randomize(initialized.bap.envelopeIv)) {
         SecureZeroMemory(&initialized, sizeof initialized);
         build_data::shutdown();
+        account::inventory::item_names::shutdown();
+        account::characters::shutdown();
         return false;
     }
     initialized.signOn.relayAddress = kLoopbackAddress;
     // The published relay port is the one the listener binds, so both move with one setting.
     initialized.signOn.relayPort = core::settings::get().server.bapPort;
     initialized.signOn.tokenLifetimeSeconds = kDefaultTokenLifetimeSeconds;
-    initialized.account = runtimeAccount;
+    initialized.account = activeAccount;
     initialized.activity.defaults = activityDefaults;
     initialized.investment.family5.objectSoid = kGlobalFamily5Soid;
     // Only the override lists come from settings. Identity and gate stay owned by State.
@@ -244,8 +135,8 @@ bool initialize(void* module,
     // The arm is account-wide and rides the first ws-503, which goes out before any pick. Nothing
     // is selected at boot, so it is armed when any authored character carries the bypass. The
     // per-character objB byte is the other half, and it still decides which character it opens.
-    for (std::size_t index = 0; index < runtimeAccount.characterCount; ++index) {
-        if (runtimeAccount.characters[index].contentBypass) {
+    for (std::size_t index = 0; index < activeAccount.characterCount; ++index) {
+        if (activeAccount.characters[index].contentBypass) {
             initialized.investment.family5.contentGateArm = true;
             break;
         }
@@ -265,23 +156,13 @@ void shutdown() noexcept {
     SecureZeroMemory(&runtime::storage::g_state, sizeof runtime::storage::g_state);
     ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
     build_data::shutdown();
+    account::inventory::item_names::shutdown();
+    account::characters::shutdown();
 }
 
 /** @return Immutable generated SignOn session fields. */
 const SignOnState& sign_on() noexcept {
     return runtime::storage::g_state.signOn;
-}
-
-/** Ensures every native profile action source has one unique runtime item-instance key. */
-bool ensure_profile_item_identities() noexcept {
-    AcquireSRWLockExclusive(&runtime::storage::g_stateLock);
-    AccountState candidate = runtime::storage::g_state.account;
-    const bool ready = canonicalize_profile_item_identities(candidate);
-    if (ready) {
-        runtime::storage::g_state.account = candidate;
-    }
-    ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
-    return ready;
 }
 
 /**

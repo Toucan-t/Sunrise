@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <variant>
 
 #include "../../middleware/web_service/messages/opcode206.h"
 #include "../../state/runtime/runtime.h"
@@ -17,54 +16,34 @@ struct Outcome {
     /** An opcode-504 pick moved the selection and its Family-4 object still has to follow. */
     bool hasSelectedCharacter{};
     std::uint64_t selectedCharacterSoid{};
-    /** A request prepares at most one State mutation; the alternative owns only that payload. */
-    using Mutation = std::variant<std::monostate,
-                                  state::PendingEquipmentSwap,
-                                  state::PendingItemAcquisition,
-                                  state::PendingProfileItemAcquisition,
-                                  state::PendingItemDismantle,
-                                  state::PendingSocketPlug,
-                                  state::PendingItemState>;
-    Mutation mutation{};
+    /** Opcode 501 created a new runtime character whose Queuez residents still need publishing. */
+    bool hasCreatedCharacter{};
+    std::uint64_t createdCharacterSoid{};
+    /** Opcode 502 prepared one character-select roster/member deletion. */
+    bool hasCharacterDeletion{};
+    state::PendingCharacterDeletion characterDeletion{};
+    /** Opcode 403/404 prepared a selected-character inventory move for atomic Queuez publication. */
+    bool hasEquipmentMutation{};
+    state::PendingInventoryMove equipmentMutation{};
+    /** Opcode 1820 prepared one selected-character Collections acquisition. */
+    bool hasItemAcquisition{};
+    state::PendingItemAcquisition itemAcquisition{};
+    /** Opcode 1820 prepared one account-wide profile-stack acquisition. */
+    bool hasProfileItemAcquisition{};
+    state::PendingProfileItemAcquisition profileItemAcquisition{};
+    /** Opcode 402 prepared removal of one unequipped selected-character item. */
+    bool hasItemDismantle{};
+    state::PendingItemDismantle itemDismantle{};
+    /** Opcode 402 prepared an account-wide profile-stack decrement/removal. */
+    bool hasProfileItemDismantle{};
+    state::PendingProfileItemDismantle profileItemDismantle{};
+    /** Opcode 903/1901 prepared one owned item socket/appearance plug replacement. */
+    bool hasSocketMutation{};
+    state::PendingSocketPlug socketMutation{};
+    /** Opcode 406 prepared one accumulated owned-item state change. */
+    bool hasItemStateMutation{};
+    state::PendingItemState itemStateMutation{};
 };
-
-/** @return The prepared mutation of the requested type, or null when another route ran. */
-template <typename Mutation>
-[[nodiscard]] const Mutation* mutation_if(const Outcome& outcome) noexcept {
-    return std::get_if<Mutation>(&outcome.mutation);
-}
-
-/** Records the final opcode-403/404 reply after its paired Family-4 version is known. */
-void report_equip_response(const middleware::web_service::Message& message,
-                           std::int32_t family4Version,
-                           std::span<const std::byte> response) noexcept;
-
-/** Records an item-creation reply after its exact Family-4 version and instance are known. */
-void report_item_acquisition_response(const middleware::web_service::Message& message,
-                                      std::int32_t family4Version,
-                                      std::uint64_t acquiredInstanceSoid,
-                                      std::span<const std::byte> response) noexcept;
-
-/** Records the final profile-stack creation reply and exact Family-4 account revision. */
-void report_profile_item_acquisition_response(const middleware::web_service::Message& message,
-                                              std::int32_t family4Version,
-                                              std::uint32_t definitionHash,
-                                              std::int32_t quantity,
-                                              std::span<const std::byte> response) noexcept;
-
-/** Records a dismantle reply after its exact Family-4 version and removed instance are known. */
-void report_item_dismantle_response(const middleware::web_service::Message& message,
-                                    std::int32_t family4Version,
-                                    std::uint64_t dismantledInstanceSoid,
-                                    std::span<const std::byte> response) noexcept;
-
-/** Records a socket-action reply after its exact item-instance Family-4 revision is known. */
-void report_socket_plug_response(const middleware::web_service::Message& message,
-                                 std::int32_t family4Version,
-                                 std::uint64_t targetInstanceSoid,
-                                 std::uint8_t socketLane,
-                                 std::uint16_t plugDefinitionIndex,
-                                 std::span<const std::byte> response) noexcept;
 
 /**
  * Answers one whole supported Web Service request body.
@@ -82,10 +61,16 @@ void report_socket_plug_response(const middleware::web_service::Message& message
  * @param request Whole decrypted svc-10 body.
  * @param response Svc-11 response-body storage owned by the caller.
  * @param written Gets the encoded response-body size, or zero when the header does not parse.
- * @param outcome Gets the prepared action for the caller to publish, and is left empty when
- * the action was refused or the reply could not be encoded.
+ * @param outcome Gets a valid family selector only after the response is encoded.
  * @return False only when the envelope header does not parse.
  */
+[[nodiscard]] bool consume(std::span<const std::byte> request,
+                           std::span<std::byte> response,
+                           std::size_t& written,
+                           Outcome& outcome,
+                           std::int32_t nextFamily4Version) noexcept;
+
+/** Compatibility wrapper for callers without a resident Family-4 version. */
 [[nodiscard]] bool consume(std::span<const std::byte> request,
                            std::span<std::byte> response,
                            std::size_t& written,

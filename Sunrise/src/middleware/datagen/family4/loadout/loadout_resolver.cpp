@@ -16,14 +16,7 @@ namespace {
 namespace authored_inventory = state::account::inventory;
 namespace build_buckets = state::build_data::inventory::buckets;
 
-/**
- * Records one runtime-derived semantic-to-native equipment-slot link.
- * @param semanticIndex Stable semantic slot array index.
- * @param nativeSlot Installed native equipment slot.
- * @param semanticToNative Shared cross-character semantic mapping.
- * @param nativeToSemantic Shared native collision map.
- * @return True when the relationship agrees with every previously resolved item.
- */
+/** Records one runtime-derived semantic-to-native equipment-slot link. */
 [[nodiscard]] bool record_equipment_slot(
     std::size_t semanticIndex,
     std::uint8_t nativeSlot,
@@ -47,13 +40,7 @@ namespace build_buckets = state::build_data::inventory::buckets;
     return true;
 }
 
-/**
- * Places one item into the lowest free row inside its runtime bucket range.
- * @param candidate Resolved item and validated character bucket.
- * @param occupied Shared physical-row occupancy map.
- * @param output Receives the placed item.
- * @return True when the bucket contains an unused row.
- */
+/** Places one item into the lowest free row inside its runtime bucket range. */
 [[nodiscard]] bool place_item(const Candidate& candidate,
                               std::array<bool, build_buckets::kCharacterSlotCapacity>& occupied,
                               ResolvedItem& output) noexcept {
@@ -156,7 +143,7 @@ bool resolve_owned_instances(const state::AccountState& account,
     return resolve_character_instances(account, characterIndex, true, output);
 }
 
-/** Resolves one selected character's authored equipment through installed build data. */
+/** Resolves one selected character's authored equipment and inventory through installed build data. */
 bool resolve(const state::AccountState& account,
              std::size_t selectedCharacterIndex,
              ResolvedLoadout& output) noexcept {
@@ -185,7 +172,8 @@ bool resolve(const state::AccountState& account,
     std::size_t selectedInventoryCount = 0;
     std::array<std::uint64_t, state::kCharacterCapacity * kItemCapacity> instanceSoids{};
     std::size_t instanceSoidCount = 0;
-    // Every character contributes to one stable semantic-to-native slot contract.
+
+    // Every character contributes to one stable semantic-to-native slot contract and identity set.
     for (std::size_t characterIndex = 0; characterIndex < account.characterCount;
          ++characterIndex) {
         const state::CharacterState& character = account.characters[characterIndex];
@@ -199,11 +187,11 @@ bool resolve(const state::AccountState& account,
             if (!authored.has_value()) {
                 continue;
             }
-            // Instance keys are account-wide identities even though only one loadout is encoded.
             const auto instanceSoidEnd =
                 instanceSoids.cbegin() + static_cast<std::ptrdiff_t>(instanceSoidCount);
-            if (std::find(instanceSoids.cbegin(), instanceSoidEnd, authored->instanceSoid)
-                != instanceSoidEnd) {
+            if (instanceSoidCount >= instanceSoids.size()
+                || std::find(instanceSoids.cbegin(), instanceSoidEnd, authored->instanceSoid)
+                       != instanceSoidEnd) {
                 return false;
             }
             instanceSoids[instanceSoidCount++] = authored->instanceSoid;
@@ -253,7 +241,6 @@ bool resolve(const state::AccountState& account,
         if (!selectedPresent[semanticIndex]) {
             continue;
         }
-        // Row placement is all or nothing; one full runtime bucket rejects the whole loadout.
         if (staged.itemCount >= staged.items.size()
             || !place_item(
                 selectedCandidates[semanticIndex], occupied, staged.items[staged.itemCount])) {
@@ -276,7 +263,6 @@ bool resolve(const state::AccountState& account,
               });
     staged.nextInventorySerial = account.characters[selectedCharacterIndex].nextInventorySerial;
 
-    // Counts are the publication-stability gate for the mappings resolved above.
     if (state::build_data::item_definition_count() != itemDefinitionCount
         || state::build_data::socket_entry_list_count() != socketEntryListCount) {
         return false;

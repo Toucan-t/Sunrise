@@ -123,7 +123,6 @@ bool initialize(void* module, std::wstring_view packagesDirectory) noexcept {
         core::ui::busy::begin(core::ui::busy::Task::manifestBuild);
         complete = scanner::extract(packagesDirectory,
                                     std::span(g_candidates).first(candidateCount),
-                                    directoryFingerprint,
                                     g_stagedRows,
                                     rowCount,
                                     buildFingerprint,

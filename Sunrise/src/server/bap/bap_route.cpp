@@ -2,8 +2,6 @@
 
 #include <array>
 #include <atomic>
-#include <cstdio>
-#include <limits>
 
 #include "../../core/logging/log.h"
 #include "../../state/matchmaking/matchmaking_state.h"
@@ -16,40 +14,6 @@ namespace {
 SRWLOCK g_lock{SRWLOCK_INIT};
 std::array<Session, kSessionCount> g_sessions{};
 Scratch g_scratch{};
-std::uint64_t g_accountGeneration{};
-
-/** Arms every other active peer after one shared-account transaction is published. */
-void publish_account_mutation(Session& origin) noexcept {
-    origin.accountMutationPublished = false;
-    g_accountGeneration = g_accountGeneration == (std::numeric_limits<std::uint64_t>::max)()
-                              ? 1
-                              : g_accountGeneration + 1;
-    origin.accountGeneration = g_accountGeneration;
-    origin.accountResyncGeneration = g_accountGeneration;
-    origin.accountResyncArmed = false;
-    std::size_t armed = 0;
-    for (auto& peer : g_sessions) {
-        if (&peer == &origin || peer.id == 0 || !peer.authenticated || !peer.queuez.family4Active) {
-            continue;
-        }
-        peer.accountResyncGeneration = g_accountGeneration;
-        peer.accountResyncArmed = true;
-        ++armed;
-    }
-    std::array<char, core::log::kLineCapacity> line{};
-    const int count = std::snprintf(line.data(),
-                                    line.size(),
-                                    "ev=queuez stage=peer_resync_arm result=ok generation=%llu "
-                                    "origin=%u peers=%zu",
-                                    static_cast<unsigned long long>(g_accountGeneration),
-                                    origin.id,
-                                    armed);
-    if (count > 0) {
-        core::log::write(core::log::Channel::server,
-                         core::log::Level::debug,
-                         {line.data(), static_cast<std::size_t>(count)});
-    }
-}
 
 /** @param id Nonzero connection id. @return Matching open session, or null. */
 [[nodiscard]] Session* session_for(std::uint32_t id) noexcept {
@@ -134,10 +98,6 @@ void clear_session(Session& session) noexcept {
     if (!handled) {
         return false;
     }
-    if (frame.frameType == middleware::bap::FrameType::encrypted
-        && session->accountMutationPublished) {
-        publish_account_mutation(*session);
-    }
     // A frame response can carry one already-due push in the same bounded socket write.
     bool touchesScratch = true;
     std::size_t deferred = 0;
@@ -206,6 +166,165 @@ bool consume(const client::network::BapRequest& request,
     return success;
 }
 
+/** Arms one account/profile refresh, optionally adding a new resident action-source item first. */
+bool request_profile_item_refresh(std::uint64_t instanceSoid, bool addResident) noexcept {
+    if (addResident && instanceSoid == 0) {
+        return false;
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    bool armed = false;
+    for (Session& session : g_sessions) {
+        if (session.id == 0 || !session.authenticated || !session.queuez.family4Active
+            || session.queuez.family4RootSoid == 0
+            || session.queuez.family3Phase != encrypted::queuez::Family3Phase::normal
+            || session.family4RepushArmed || session.bannerRepushArmed
+            || session.inventoryAddRefreshPending || session.equipmentRefreshPending
+            || session.socketRefreshPending || session.profileRefreshPending
+            || session.accountRefreshPending) {
+            continue;
+        }
+        session.profileRefreshInstanceSoid = instanceSoid;
+        session.profileRefreshAddResident = addResident;
+        session.profileRefreshPending = true;
+        session.editorPersistencePending = true;
+        session.editorRefreshFailed = false;
+        armed = true;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return armed;
+}
+
+/** Arms one deferred object refresh on every authenticated peer with a resident account family. */
+bool request_account_refresh() noexcept {
+    AcquireSRWLockExclusive(&g_lock);
+    bool armed = false;
+    for (Session& session : g_sessions) {
+        if (session.id == 0 || !session.authenticated || !session.queuez.family4Active
+            || session.queuez.family4RootSoid == 0
+            || session.queuez.family3Phase != encrypted::queuez::Family3Phase::normal
+            || session.family4RepushArmed || session.bannerRepushArmed) {
+            continue;
+        }
+        session.accountRefreshPending = true;
+        session.editorPersistencePending = true;
+        session.editorRefreshFailed = false;
+        armed = true;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return armed;
+}
+
+/** Arms one dependency-ordered equipped-item body plus its character/roster mirrors. */
+bool request_equipment_refresh(std::uint64_t characterSoid, std::uint64_t instanceSoid) noexcept {
+    if (characterSoid == 0 || instanceSoid == 0) {
+        return false;
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    bool armed = false;
+    for (Session& session : g_sessions) {
+        if (session.id == 0 || !session.authenticated || !session.queuez.family4Active
+            || session.queuez.family4RootSoid == 0
+            || session.queuez.family3Phase != encrypted::queuez::Family3Phase::normal
+            || session.family4RepushArmed || session.bannerRepushArmed
+            || session.equipmentRefreshPending || session.socketRefreshPending) {
+            continue;
+        }
+        session.equipmentRefreshCharacterSoid = characterSoid;
+        session.equipmentRefreshInstanceSoid = instanceSoid;
+        session.equipmentRefreshPending = true;
+        session.editorPersistencePending = true;
+        session.editorRefreshFailed = false;
+        armed = true;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return armed;
+}
+
+/** Arms one manifest-preserving socket body refresh and optional appearance mirrors. */
+bool request_socket_refresh(std::uint64_t characterSoid,
+                            std::uint64_t instanceSoid,
+                            bool equipped) noexcept {
+    if (characterSoid == 0 || instanceSoid == 0) {
+        return false;
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    bool armed = false;
+    for (Session& session : g_sessions) {
+        if (session.id == 0 || !session.authenticated || !session.queuez.family4Active
+            || session.queuez.family4RootSoid == 0
+            || session.queuez.family3Phase != encrypted::queuez::Family3Phase::normal
+            || session.family4RepushArmed || session.bannerRepushArmed
+            || session.socketRefreshPending || session.inventoryAddRefreshPending
+            || session.equipmentRefreshPending || session.characterRefreshPending
+            || session.accountRefreshPending || session.rosterRefreshPending
+            || session.bannerRefreshPending) {
+            continue;
+        }
+        session.socketRefreshCharacterSoid = characterSoid;
+        session.socketRefreshInstanceSoid = instanceSoid;
+        session.socketRefreshIncludeCharacter = equipped;
+        session.socketRefreshPending = true;
+        session.editorPersistencePending = true;
+        session.editorRefreshFailed = false;
+        armed = true;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return armed;
+}
+
+/** Arms one new item resident followed by its selected-character after-image. */
+bool request_inventory_add_refresh(std::uint64_t characterSoid,
+                                   std::uint64_t instanceSoid) noexcept {
+    if (characterSoid == 0 || instanceSoid == 0) {
+        return false;
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    bool armed = false;
+    for (Session& session : g_sessions) {
+        if (session.id == 0 || !session.authenticated || !session.queuez.family4Active
+            || session.queuez.family4RootSoid == 0
+            || session.queuez.family3Phase != encrypted::queuez::Family3Phase::normal
+            || session.family4RepushArmed || session.bannerRepushArmed
+            || session.inventoryAddRefreshPending || session.equipmentRefreshPending
+            || session.socketRefreshPending || session.characterRefreshPending || session.accountRefreshPending
+            || session.rosterRefreshPending || session.bannerRefreshPending) {
+            continue;
+        }
+        session.inventoryAddCharacterSoid = characterSoid;
+        session.inventoryAddInstanceSoid = instanceSoid;
+        session.inventoryAddRefreshPending = true;
+        session.editorPersistencePending = true;
+        session.editorRefreshFailed = false;
+        armed = true;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return armed;
+}
+
+/** Arms a metadata-only refresh without resending the resident Family-4 account body. */
+bool request_character_refresh(std::uint64_t characterSoid) noexcept {
+    if (characterSoid == 0) {
+        return false;
+    }
+    AcquireSRWLockExclusive(&g_lock);
+    bool armed = false;
+    for (Session& session : g_sessions) {
+        if (session.id == 0 || !session.authenticated || !session.queuez.family4Active
+            || session.queuez.family4RootSoid == 0
+            || session.queuez.family3Phase != encrypted::queuez::Family3Phase::normal
+            || session.family4RepushArmed || session.bannerRepushArmed) {
+            continue;
+        }
+        session.characterRefreshSoid = characterSoid;
+        session.characterRefreshPending = true;
+        session.editorPersistencePending = true;
+        session.editorRefreshFailed = false;
+        armed = true;
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    return armed;
+}
+
 /** Securely erases every connection-owned nonce and transform buffer. */
 void shutdown() noexcept {
     AcquireSRWLockExclusive(&g_lock);
@@ -218,7 +337,6 @@ void shutdown() noexcept {
     }
     SecureZeroMemory(g_sessions.data(), sizeof g_sessions);
     SecureZeroMemory(&g_scratch, sizeof g_scratch);
-    g_accountGeneration = 0;
     ReleaseSRWLockExclusive(&g_lock);
 }
 

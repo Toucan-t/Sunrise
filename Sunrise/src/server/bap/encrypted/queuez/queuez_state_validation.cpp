@@ -1,6 +1,7 @@
 #include "queuez_state_validation.h"
 
 #include <cstddef>
+#include <limits>
 
 namespace sunrise::server::bap::encrypted::queuez {
 namespace {
@@ -16,16 +17,6 @@ namespace {
 /** @return True when every active field and resident id make a canonical peer state. */
 bool valid(const SessionState& state) noexcept {
     if (!valid_phase(state.family3Phase)) {
-        return false;
-    }
-    // Family three has its own object store and version ladder.  It can become active one frame
-    // before the Family-4 companion during boot, but an active pair must always share one root.
-    if (state.family3Active) {
-        if (state.family3RootSoid == 0 || state.family3Version < kInitialFamilyVersion) {
-            return false;
-        }
-    } else if (state.family3RootSoid != 0 || state.family3Version != kInitialFamilyVersion
-               || state.family3Phase != Family3Phase::normal) {
         return false;
     }
     // Family zero holds no resident manifest, so its whole contract is the version ladder. An
@@ -51,9 +42,6 @@ bool valid(const SessionState& state) noexcept {
     }
     if (state.family4RootSoid == 0 || state.family4ResidentCount == 0
         || state.family4ResidentCount > state.family4Residents.size()) {
-        return false;
-    }
-    if (state.family3Active && state.family3RootSoid != state.family4RootSoid) {
         return false;
     }
     // Version zero is the full snapshot, and the roster phase leaves normal only once an
@@ -83,6 +71,94 @@ bool valid(const SessionState& state) noexcept {
         }
     }
     return state.family4Residents.front().objectSoid == state.family4RootSoid;
+}
+
+/** Stages one manifest-preserving Family-4 version that appends only new object identities. */
+bool stage_family4_additions(const SessionState& before,
+                             const middleware::queuez::Family& family,
+                             SessionState& after) noexcept {
+    after = {};
+    if (!valid(before) || !before.family4Active || before.family4RootSoid == 0
+        || before.family3Phase != Family3Phase::normal || family.type != kAccountFamilyType
+        || family.rootSoid != before.family4RootSoid || family.flags != 0
+        || family.version != before.family4Version + 1 || family.objects.empty()
+        || before.family4ResidentCount + family.objects.size() > before.family4Residents.size()) {
+        return false;
+    }
+    after = before;
+    for (const middleware::queuez::Object& object : family.objects) {
+        if (object.id == 0 || object.version == 0 || object.payload.empty()) {
+            return false;
+        }
+        for (std::size_t index = 0; index < after.family4ResidentCount; ++index) {
+            if (after.family4Residents[index].objectSoid == object.version) {
+                return false;
+            }
+        }
+        after.family4Residents[after.family4ResidentCount++] = ResidentObject{
+            object.version,
+            object.id,
+        };
+    }
+    after.family4Version = family.version;
+    return valid(after);
+}
+
+/** Stages one canonical mixed resident update/add/release Family-4 increment. */
+bool stage_family4_mutation(const SessionState& before,
+                            const middleware::queuez::Family& family,
+                            SessionState& after) noexcept {
+    after = {};
+    if (!valid(before) || !before.family4Active || before.family4RootSoid == 0
+        || before.family3Phase != Family3Phase::normal
+        || before.family4Version == (std::numeric_limits<std::int32_t>::max)()
+        || family.type != kAccountFamilyType || family.rootSoid != before.family4RootSoid
+        || family.flags != 0 || family.version != before.family4Version + 1
+        || family.objects.empty()) {
+        return false;
+    }
+
+    after = before;
+    for (const middleware::queuez::Object& object : family.objects) {
+        if (object.id == 0 || object.version == 0) {
+            return false;
+        }
+        std::size_t residentIndex = after.family4ResidentCount;
+        for (std::size_t index = 0; index < after.family4ResidentCount; ++index) {
+            if (after.family4Residents[index].objectSoid == object.version) {
+                residentIndex = index;
+                break;
+            }
+        }
+        if (object.payload.empty()) {
+            if (residentIndex >= after.family4ResidentCount || residentIndex == 0
+                || after.family4Residents[residentIndex].definitionId != object.id) {
+                return false;
+            }
+            for (std::size_t index = residentIndex; index + 1U < after.family4ResidentCount;
+                 ++index) {
+                after.family4Residents[index] = after.family4Residents[index + 1U];
+            }
+            --after.family4ResidentCount;
+            after.family4Residents[after.family4ResidentCount] = {};
+            continue;
+        }
+        if (residentIndex < after.family4ResidentCount) {
+            if (after.family4Residents[residentIndex].definitionId != object.id) {
+                return false;
+            }
+            continue;
+        }
+        if (after.family4ResidentCount >= after.family4Residents.size()) {
+            return false;
+        }
+        after.family4Residents[after.family4ResidentCount++] = ResidentObject{
+            object.version,
+            object.id,
+        };
+    }
+    after.family4Version = family.version;
+    return valid(after);
 }
 
 } // namespace sunrise::server::bap::encrypted::queuez

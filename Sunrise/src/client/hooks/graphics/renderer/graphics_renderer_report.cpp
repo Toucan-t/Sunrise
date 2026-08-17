@@ -23,9 +23,8 @@ constexpr std::array<std::string_view, 6> kStageNames{
     "shutdown",
 };
 
-/** One name per Reason value, in Reason order. One per line to match the enum. */
-// clang-format off
-constexpr std::array<std::string_view, 19> kReasonNames{
+/** One name per Reason value, in Reason order. */
+constexpr std::array<std::string_view, 18> kReasonNames{
     "none",
     "window",
     "window_thread",
@@ -33,7 +32,6 @@ constexpr std::array<std::string_view, 19> kReasonNames{
     "description",
     "device",
     "context",
-    "device_removed",
     "back_buffer",
     "view",
     "view_format",
@@ -46,7 +44,6 @@ constexpr std::array<std::string_view, 19> kReasonNames{
     "rebuild_target",
     "surface_lost",
 };
-// clang-format on
 
 /** Both tables are indexed by the enum value, so a new entry must extend them. */
 static_assert(kStageNames.size() == static_cast<std::size_t>(Stage::shutdown) + 1);

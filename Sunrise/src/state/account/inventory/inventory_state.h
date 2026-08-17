@@ -51,29 +51,23 @@ struct Sockets {
 
 /** Account-wide stacks can occupy every row of the native 701-row profile inventory. */
 inline constexpr std::size_t kProfileItemCapacity = 701;
-/** The supported mod and shader profile bucket runs reserve 50 action-source rows each. */
+/** Mod and shader profile buckets reserve up to 100 resident action-source identities. */
 inline constexpr std::size_t kProfileActionSourceCapacity = 100;
-/** Runtime-owned SOIDs for profile stacks use a namespace separate from created item instances. */
+/** Runtime-owned profile action sources use a namespace separate from character item SOIDs. */
 inline constexpr std::uint64_t kFirstProfileItemInstanceSoid = 0x5000000000000001ULL;
 /**
- * Native item-state bit the Client sets to lock one item against destruction.
- * Confirmed against the installed build by three observed lock and unlock transitions.
- */
-inline constexpr std::uint32_t kLockedItemFlag = 0x1;
-/**
  * The 16 supported character equipment buckets reserve 151 native rows in this build. One row
-
- * * per semantic slot can be equipped, leaving at most 135 simultaneously unequipped instances.
+ * per semantic slot can be equipped, leaving at most 135 simultaneously unequipped instances.
  */
 inline constexpr std::size_t kCharacterItemCapacity = 135;
 
 /** One authored account-wide item, placed by the inventory bucket its definition names. */
 struct ProfileItem {
-    /** Stable runtime identity required to materialize this row as an inventory action source. */
+    /** Optional stable runtime identity for profile rows that are also Family-4 action sources. */
     std::uint64_t instanceSoid{};
     std::uint32_t definitionHash{};
     std::int32_t quantity{};
-    /** Rising generation copied into the native row and matched by acquisition feedback. */
+    /** Rising generation copied into the native row when profile inventory is mutated. */
     std::int32_t mutationSerial{};
 };
 
@@ -83,14 +77,14 @@ struct Item {
     std::uint32_t definitionHash{};
     std::int32_t level{};
     std::int32_t quantity{};
-    /** Rising per-character generation assigned whenever this item changes inventory rows. */
+    /** Rising per-character generation assigned when the item changes inventory rows. */
     std::int32_t mutationSerial{};
-    /** Native accumulated item-state bits such as the finisher favorite marker. */
+    /** Native accumulated item-state bits such as favorite markers. */
     std::uint32_t flags{};
     Sockets sockets;
 };
 
-/** Ordered unequipped items placed into their native character-inventory bucket ranges. */
+/** Ordered unequipped items placed into their installed character-inventory bucket ranges. */
 struct CharacterItems {
     std::array<Item, kCharacterItemCapacity> values{};
     std::size_t count{};
@@ -107,6 +101,9 @@ struct Equipment {
  * @return Matching slot, or no value for an unknown name.
  */
 [[nodiscard]] std::optional<EquipmentSlot> slot_from_name(std::string_view name) noexcept;
+
+/** @return Stable configuration/display name for one semantic equipment slot. */
+[[nodiscard]] std::string_view slot_name(EquipmentSlot slot) noexcept;
 
 /**
  * Checks the canonical socket policy and every authored plug hash.
