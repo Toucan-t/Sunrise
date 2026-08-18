@@ -46,6 +46,32 @@ bool replace(std::span<const Definition> definitions) noexcept {
     return g_definitions.replace(definitions);
 }
 
+/** Adds or replaces one live subclass-selection row without clearing the published domain. */
+bool merge(const Definition& definition) noexcept {
+    const std::array<Definition, 1> candidate{definition};
+    if (!valid(std::span<const Definition>{candidate})) {
+        return false;
+    }
+
+    const Lock::Exclusive guard(g_lock);
+    std::array<Definition, kDefinitionCapacity> rows{};
+    std::size_t count = 0;
+    if (!g_definitions.snapshot(rows, count)) {
+        return false;
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        if (same_key(rows[index], definition)) {
+            rows[index] = definition;
+            return g_definitions.replace(std::span(rows).first(count));
+        }
+    }
+    if (count >= rows.size()) {
+        return false;
+    }
+    rows[count++] = definition;
+    return g_definitions.replace(std::span(rows).first(count));
+}
+
 /** Finds the buckets one subclass publishes under one ability selection. */
 bool find(std::uint16_t socketEntryListIndex,
           const Selection& selection,

@@ -1,0 +1,22 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Sunrise subclass stage: keep the working source files on disk and compile thin wrappers that
+    include them, intercepting only the subclass-specific entry points. Removing this targets file
+    returns the project to the exact pre-subclass compile graph.
+  -->
+  <ItemGroup>
+    <ClCompile Remove="src\client\content\items\packages\package_ability_build.cpp" />
+    <ClCompile Remove="src\client\content\items\packages\package_item_build.cpp" />
+    <ClCompile Remove="src\middleware\datagen\family4\loadout\subclass_socket_selection.cpp" />
+    <ClCompile Remove="src\server\web_service\web_service_runtime.cpp" />
+    <ClCompile Remove="src\server\bap\encrypted\queuez\queuez_outcome_staging.cpp" />
+    <ClCompile Remove="src\server\bap\encrypted\transactions\service_outcome_commit.cpp" />
+
+    <ClCompile Include="src\subclass_native\package_ability_build_wrapper.cpp" />
+    <ClCompile Include="src\subclass_native\package_item_build_wrapper.cpp" />
+    <ClCompile Include="src\subclass_native\subclass_socket_selection_wrapper.cpp" />
+    <ClCompile Include="src\subclass_native\web_service_runtime_wrapper.cpp" />
+    <ClCompile Include="src\subclass_native\queuez_outcome_staging_wrapper.cpp" />
+    <ClCompile Include="src\subclass_native\service_outcome_commit_wrapper.cpp" />
+  </ItemGroup>
+</Project>
