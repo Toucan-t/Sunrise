@@ -6,6 +6,7 @@
 
 #include "definition.h"
 #include "entity_slots/runtime.h"
+#include "script_state/definition.h"
 
 namespace sunrise::state::activity {
 
@@ -29,6 +30,40 @@ struct CurrentContext {
  * @return True when at least one joined session exists.
  */
 [[nodiscard]] bool current_context(CurrentContext& output) noexcept;
+
+
+/** Complete script-facing view of one joined activity session. */
+struct JoinedSessionSnapshot final {
+    CurrentContext context{};
+    std::int16_t activityIndex{destination::kAbsentActivityIndex};
+    std::int16_t previousActivityIndex{destination::kAbsentActivityIndex};
+    std::uint32_t scriptState{script_state::kInitialValue};
+    std::uint64_t scriptStateRevision{script_state::kInitialRevision};
+};
+
+/** Fixed output matching the bounded activity-session State table. */
+using JoinedSessionSnapshots = std::array<JoinedSessionSnapshot, kSessionCapacity>;
+
+/**
+ * Captures every joined activity session for the server script scheduler.
+ * @param output Cleared, then receives joined sessions in State-slot order.
+ * @return Number of valid entries at the beginning of output.
+ */
+[[nodiscard]] std::size_t joined_sessions_snapshot(JoinedSessionSnapshots& output) noexcept;
+
+/**
+ * Changes the server-owned mission/script state for one joined activity session.
+ * This first scripting patch does not serialize the value to Destiny yet; it creates the exact
+ * session-scoped authority point that later activity-script replication will bind to.
+ * @param sessionId Joined activity session to mutate.
+ * @param value New server mission state.
+ * @param previous Receives the state before this request.
+ * @param revision Receives the resulting script-state revision.
+ */
+[[nodiscard]] script_state::MutationResult set_script_state(std::uint64_t sessionId,
+                                                            std::uint32_t value,
+                                                            std::uint32_t& previous,
+                                                            std::uint64_t& revision) noexcept;
 
 /**
  * Prepares one allocation with State's fixed default destination, without changing State.

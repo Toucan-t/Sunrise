@@ -1,8 +1,12 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
 #include <string_view>
 
+#include "../../../../../core/logging/log.h"
 #include "../../../../../state/account/account_state.h"
 #include "../../../../../state/activity/defaults/activity_defaults_snapshot.h"
 #include "../../../../../state/activity/destination/activity_destination_snapshot.h"
@@ -35,6 +39,36 @@ constexpr std::uint32_t kFoldPrime = 16777619U;
 constexpr std::uint8_t kSlotTypeParticipation = 13;
 /** The join request names its character in the low half of the SOID, so compare on that half. */
 constexpr std::uint64_t kIdentityLowMask = 0xFFFFFFFFULL;
+/** A Garden World package name used only for the one-shot source-object diagnostic. */
+constexpr std::string_view kGardenWorldDestination = "strike_bond";
+std::atomic_bool g_gardenWorldRosterSourcesDumped{false};
+
+/** Prints the content object tag separately from the runtime registry key for each published group. */
+void report_garden_world_roster_sources(const layouts::Definition& layout,
+                                        const Scratch& scratch) noexcept {
+    if (g_gardenWorldRosterSourcesDumped.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    std::array<char, core::log::kLineCapacity> line{};
+    for (std::size_t index = 0; index < layout.rosterGroupCount; ++index) {
+        const layouts::RosterGroup& group = scratch.rosterGroups[index];
+        const int written = std::snprintf(
+            line.data(),
+            line.size(),
+            "ev=strike stage=roster_source group=%zu table_index=%u object=0x%08X "
+            "key=0x%08X slots=%u",
+            index,
+            static_cast<unsigned>(layout.rosterGroups[index]),
+            group.objectTag,
+            group.registryKey,
+            static_cast<unsigned>(group.slotCount));
+        if (written > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(written)});
+        }
+    }
+}
 
 /**
  * Finds the full authored SOID for the character the join request named.
@@ -158,6 +192,9 @@ RosterOutcome build_roster_snapshot(Session& session,
     if (!fill_roster(layout, scratch, snapshot.roster)) {
         return RosterOutcome::noGroups;
     }
+    if (name == kGardenWorldDestination) {
+        report_garden_world_roster_sources(layout, scratch);
+    }
 
     const state::activity::defaults::FallbackPolicy& fallback =
         defaults.defaultDestination.fallback;
@@ -192,6 +229,12 @@ RosterOutcome build_roster_snapshot(Session& session,
         state::activity::destination::attachable_spawn_set_hash(selection, fallback.spawnSetHash);
     snapshot.hasSpawnOverride =
         snapshot.spawnSetHash != 0 && snapshot.spawnSetHash != message::kAbsentSpawnSetHash;
+
+    // The first successful msg-5 publication registers the group keys only. The client answers the
+    // registration with its normal activity-state refresh, and that subsequent send carries phase
+    // 2 object/authority state. This restores the two-stage roster startup without touching any
+    // client-side compatibility bypass or changing the authored roster contents.
+    snapshot.phaseOneOnly = session.activityRosterSends == 0;
     snapshot.stateSequence = next_state_sequence(session, fold_groups(snapshot.roster), burst);
     return RosterOutcome::published;
 }

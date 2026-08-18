@@ -111,7 +111,7 @@ bool initialize(void* module) noexcept {
         stage = "content_manifest";
     } else if (!middleware::initialize()) {
         stage = "middleware";
-    } else if (!server::initialize()) {
+    } else if (!server::initialize(module)) {
         stage = "server";
     } else if (!client::initialize(module)) {
         stage = "client";

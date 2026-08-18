@@ -30,6 +30,10 @@ constexpr std::array<const char*, kHandleCount> kSlotNames{
     "content_untracked_getter",
     "signon_readiness_failure",
     "signon_readiness_ready",
+    "msg5_read_bits",
+    "msg5_read_wide",
+    "msg5_read_bool",
+    "msg5_stream_status",
 };
 // A short table would zero-fill its tail and shift every later name onto the wrong slot.
 static_assert(kSlotNames.back() != nullptr);

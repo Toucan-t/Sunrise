@@ -2,6 +2,11 @@
 
 #include <Windows.h>
 
+#include <array>
+#include <cstdio>
+
+#include "../../../core/logging/log.h"
+
 namespace sunrise::server::bap::encrypted {
 namespace {
 
@@ -14,6 +19,21 @@ constexpr std::uint64_t kBannerRepushDelayMs = 400;
  * The slice-set load step costs 9.2 to 14.1 s, so this covers it.
  */
 constexpr std::uint64_t kTransitionWindowMs = 15'000;
+
+/** Reports the one-shot normal keepalive re-arm caused by the first client patch epoch. */
+void report_post_epoch_roster_arm(std::uint64_t sessionId) noexcept {
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=strike stage=patch_epoch result=roster_armed session=0x%llX",
+        static_cast<unsigned long long>(sessionId));
+    if (written > 0) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::info,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
+}
 
 } // namespace
 
@@ -53,8 +73,20 @@ void publish_connection_fields(Session& session,
         session.activityCharacterSoid = fields.joinCharacterSoid;
     }
     if (fields.retainsPatchEpoch) {
+        const bool firstPatchEpoch = !session.activityPatchEpochSeen;
         session.activityPatchEpoch = fields.patchEpoch;
         session.activityPatchEpochSeen = true;
+
+        // Roster publication is gated on activityPatchEpochSeen, but the periodic keepalive may
+        // already have moved its next due tick several seconds into the future after a pre-epoch
+        // no-op. Re-arm the normal keepalive only on the first accepted epoch. This happens after
+        // the service transaction commits, so the keepalive sees the retained epoch and sends the
+        // ordinary global-state -> membership -> roster sequence with burst=false. Repeated type-52
+        // sentinel messages do not keep forcing extra roster traffic.
+        if (firstPatchEpoch && session.activitySessionId != 0) {
+            session.activityKeepaliveDueTick = 0;
+            report_post_epoch_roster_arm(session.activitySessionId);
+        }
     }
     if (fields.opensTransitionWindow) {
         session.activityTransitionUntilTick = GetTickCount64() + kTransitionWindowMs;

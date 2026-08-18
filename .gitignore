@@ -8,3 +8,4 @@
 *.sln.docstates
 *.aps
 *.log
+/Sunrise/vendor/lua/packages/

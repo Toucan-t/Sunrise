@@ -5,7 +5,7 @@
 namespace sunrise::server {
 
 /** Starts the in-process server surface. */
-[[nodiscard]] bool initialize() noexcept;
+[[nodiscard]] bool initialize(void* module) noexcept;
 
 /** Runs one bounded server service slice. @param now Monotonic tick count. */
 void service(std::uint64_t now) noexcept;

@@ -4,13 +4,14 @@
 #include "../../core/logging/log.h"
 #include "../bap/runtime.h"
 #include "../http/server_http.h"
+#include "../script/runtime.h"
 #include "../transport/bap_listener.h"
 #include "../ui/runtime/server_ui_module_runtime.h"
 
 namespace sunrise::server {
 
 /** Registers Server consumers with the Client networking boundary. */
-bool initialize() noexcept {
+bool initialize(void* module) noexcept {
     if (!client::network::register_http_consumer(&http::consume)) {
         return false;
     }
@@ -22,6 +23,8 @@ bool initialize() noexcept {
                              "ev=transport stage=listen result=fail");
         }
         if (ui::runtime::initialize()) {
+            // Scripting is optional. Missing/broken external scripts must not take down BAP/HTTP.
+            (void)script::initialize(module);
             return true;
         }
         transport::shutdown();
@@ -35,10 +38,12 @@ bool initialize() noexcept {
 /** Runs one bounded server service slice. @param now Monotonic tick count. */
 void service(std::uint64_t now) noexcept {
     transport::service(now);
+    script::service(now);
 }
 
 /** Unregisters Server consumers in reverse registration order. */
 void shutdown() noexcept {
+    script::shutdown();
     ui::runtime::shutdown();
     transport::shutdown();
     client::network::unregister_bap_consumer(&bap::consume);

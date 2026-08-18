@@ -1,0 +1,7 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Sunrise itself builds with the v145 toolset. The lua.5.4.8 native NuGet
+    package predates v145, so do not import its toolset-selection props here.
+    Directory.Build.targets consumes the package's v143 binaries explicitly.
+  -->
+</Project>

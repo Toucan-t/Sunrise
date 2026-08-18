@@ -19,6 +19,10 @@ struct Targets {
     std::byte* contentManifestSignatureGate{};
     std::byte* bubbleAuthorityDecoder{};
     std::byte* contentUntrackedGetter{};
+    std::byte* msg5ReadBits{};
+    std::byte* msg5ReadWide{};
+    std::byte* msg5ReadBool{};
+    std::byte* msg5StreamStatus{};
     std::byte* contentIdToken{};
 };
 

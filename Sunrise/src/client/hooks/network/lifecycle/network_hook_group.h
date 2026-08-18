@@ -21,6 +21,14 @@ inline constexpr std::array kGameSlots{
     HookSlot::signOnReadinessReady,
 };
 
+/** Confirmed native bitstream helpers used only by the bounded msg-5 diagnostic. */
+inline constexpr std::array kMsg5DiagnosticSlots{
+    HookSlot::msg5ReadBits,
+    HookSlot::msg5ReadWide,
+    HookSlot::msg5ReadBool,
+    HookSlot::msg5StreamStatus,
+};
+
 /** Steam networking hooks, found after SteamAPI_Init. */
 inline constexpr std::array kPlatformSlots{
     HookSlot::authenticationStatus,

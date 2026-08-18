@@ -3,8 +3,11 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <string_view>
 
+#include "../../../../../core/logging/log.h"
 #include "../../../../../middleware/bap/activity_message/activity_global_state_encoder.h"
 #include "../../../../../middleware/secure_channel/runtime.h"
 #include "../../../../../state/activity/defaults/activity_defaults_snapshot.h"
@@ -39,6 +42,31 @@ void copy_name(const state::activity::destination::DestinationSelection& selecti
         state.name[index] = static_cast<char>(selection.packageName[index]);
     }
     state.nameLength = length;
+}
+
+void report_global_state(std::uint64_t sessionId,
+                         const message::GlobalActivityState& body) noexcept {
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=strike stage=global_state direction=out type=1 session=0x%llX name=%.*s "
+        "activity=%d from=%d reason=%d descriptor_bits=%zu bubbles=%u slice=%u spawn=0x%08X",
+        static_cast<unsigned long long>(sessionId),
+        static_cast<int>(body.nameLength),
+        body.name.data(),
+        static_cast<int>(body.activityIndex),
+        static_cast<int>(body.fromActivityIndex),
+        static_cast<int>(body.reason),
+        body.descriptorBitLength,
+        static_cast<unsigned>(body.bubbleCount),
+        static_cast<unsigned>(body.sliceSetIndex),
+        body.spawnSetHash);
+    if (written > 0) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::info,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
 }
 
 } // namespace
@@ -106,6 +134,8 @@ bool append_global_state_notification(Scratch& scratch,
     if (written > response.size() || !resolve_state(sessionId, body, selection)) {
         return false;
     }
+
+    report_global_state(sessionId, body);
 
     const std::size_t initialWritten = written;
     auto initialNonce = nonce;

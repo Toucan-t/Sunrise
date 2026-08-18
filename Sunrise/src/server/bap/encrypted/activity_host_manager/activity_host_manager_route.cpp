@@ -77,6 +77,30 @@ void report_selection(const request_selection::ActivityManagerSelection& source)
                          core::log::Level::info,
                          {line.data(), static_cast<std::size_t>(written)});
     }
+
+    std::array<char, core::log::kLineCapacity> detail{};
+    const int detailWritten = std::snprintf(
+        detail.data(),
+        detail.size(),
+        "ev=strike stage=selection result=observed activity=%d from=%d reason=%d "
+        "descriptor_bits=%zu name_bit=%zu has_element=%u element=%d has_bubble=%u "
+        "bubble=0x%08X has_spawn=%u spawn=0x%08X",
+        static_cast<int>(source.activityIndex),
+        static_cast<int>(source.sourceActivityIndex),
+        static_cast<int>(source.reason),
+        source.descriptorBitLength,
+        source.packageNameBitOffset,
+        static_cast<unsigned>(source.hasElementIndex),
+        source.hasElementIndex ? static_cast<int>(source.elementIndex) : -1,
+        static_cast<unsigned>(source.hasArrivalBubbleHash),
+        source.hasArrivalBubbleHash ? source.arrivalBubbleHash : 0U,
+        static_cast<unsigned>(source.hasSpawnSetHash),
+        source.hasSpawnSetHash ? source.spawnSetHash : 0U);
+    if (detailWritten > 0) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::info,
+                         {detail.data(), static_cast<std::size_t>(detailWritten)});
+    }
 }
 
 /**
@@ -205,6 +229,23 @@ bool encode_response(std::span<const std::byte> requestBody,
                          "ev=bap svc=6 stage=allocation result=fail");
         return false;
     }
+
+    {
+        std::array<char, core::log::kLineCapacity> line{};
+        const int count = std::snprintf(
+            line.data(),
+            line.size(),
+            "ev=strike stage=selection result=prepared session=0x%llX primary=%u secondary=%u",
+            static_cast<unsigned long long>(sessionId),
+            static_cast<unsigned>(selection.hasSelection),
+            static_cast<unsigned>(selection.hasSecondary));
+        if (count > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(count)});
+        }
+    }
+
     if (!middleware::bap::activity_host_manager::response::encode_response(
             sessionId, output, written)) {
         core::log::write(core::log::Channel::server,

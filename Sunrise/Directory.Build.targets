@@ -19,4 +19,68 @@
     <ClCompile Include="src\subclass_native\queuez_outcome_staging_wrapper.cpp" />
     <ClCompile Include="src\subclass_native\service_outcome_commit_wrapper.cpp" />
   </ItemGroup>
+
+  <!-- Session-scoped server Lua scripting. -->
+  <ItemGroup>
+    <ClCompile Include="src\state\activity\script_state\activity_script_state.cpp" />
+    <ClCompile Include="src\server\script\activity_registry.cpp" />
+    <ClCompile Include="src\server\script\lua_runtime.cpp" />
+    <ClInclude Include="src\state\activity\script_state\definition.h" />
+    <ClInclude Include="src\server\script\activity_registry.h" />
+    <ClInclude Include="src\server\script\runtime.h" />
+    <None Include="packages.config" />
+    <None Include="scripts\**\*.lua" />
+    <None Include="scripts\README.md" />
+    <None Include="vendor\lua\README.md" />
+  </ItemGroup>
+
+  <!--
+    lua.5.4.8 ships MSVC v143 native artifacts, while Sunrise currently builds with v145.
+    Newer MSVC linkers are binary-compatible with v143 inputs, so bypass the package's
+    old toolset mapper (which turns v145 into the literal directory "ERROR") and consume
+    the v143 include/lib/bin directories directly.
+  -->
+  <PropertyGroup>
+    <SunriseLuaNativeDir>$(ProjectDir)vendor\lua\packages\lua.5.4.8\build\native\</SunriseLuaNativeDir>
+    <SunriseLuaToolset>v143</SunriseLuaToolset>
+    <SunriseLuaLibDir>$(SunriseLuaNativeDir)lib\$(Platform)\$(SunriseLuaToolset)\$(Configuration)\</SunriseLuaLibDir>
+    <SunriseLuaBinDir>$(SunriseLuaNativeDir)bin\$(Platform)\$(SunriseLuaToolset)\$(Configuration)\</SunriseLuaBinDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(SunriseLuaNativeDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(SunriseLuaLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>lua.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <Target Name="EnsureSunriseLuaPackage" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(SunriseLuaNativeDir)include\lua.h')"
+           Text="Sunrise Lua headers are missing. Restore NuGet package lua 5.4.8 before building." />
+    <Error Condition="!Exists('$(SunriseLuaLibDir)lua.lib')"
+           Text="Sunrise Lua v143 library is missing at $(SunriseLuaLibDir)lua.lib. Restore lua 5.4.8 and verify the v143 native payload." />
+  </Target>
+
+  <!-- Scripts remain external to the DLL and editable/hot-reloadable in the output directory. -->
+  <ItemGroup>
+    <SunriseScriptSource Include="$(ProjectDir)scripts\**\*.lua" />
+  </ItemGroup>
+  <Target Name="CopySunriseScripts" AfterTargets="Build">
+    <Copy SourceFiles="@(SunriseScriptSource)"
+          DestinationFiles="@(SunriseScriptSource->'$(OutDir)scripts\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- If the NuGet payload is DLL-backed, copy its runtime beside steam_api64.dll. -->
+  <ItemGroup Condition="Exists('$(SunriseLuaBinDir)')">
+    <SunriseLuaRuntimeDll Include="$(SunriseLuaBinDir)*.dll" />
+  </ItemGroup>
+  <Target Name="CopySunriseLuaRuntime" AfterTargets="Build" Condition="'@(SunriseLuaRuntimeDll)' != ''">
+    <Copy SourceFiles="@(SunriseLuaRuntimeDll)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

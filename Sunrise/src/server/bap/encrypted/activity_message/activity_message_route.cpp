@@ -34,6 +34,56 @@ namespace epoch_message = service::patch_epoch;
 /** Activity message type 3 starts the client join transaction. */
 constexpr std::uint32_t kJoinRequestMessageType = 3;
 
+/** Diagnostic name for the activity-message types that matter to mission bring-up. */
+[[nodiscard]] const char* diagnostic_message_name(std::uint32_t type) noexcept {
+    switch (type) {
+    case 0: return "entity_slot_notification";
+    case 1: return "global_activity_state";
+    case 3: return "activity_join_request";
+    case 4: return "activity_join_result";
+    case 5: return "sensor_authority_state";
+    case 12: return "membership_identity";
+    case 16: return "client_keepalive";
+    case 18: return "activity_state_refresh";
+    case 19: return "incident";
+    case 20: return "entity_slot_request_variant";
+    case 21: return "entity_slot_lease_request";
+    case 22: return "client_authoritative_data";
+    case 23: return "client_identity";
+    case 26: return "abandon_authority";
+    case 27: return "request_purge";
+    case 29: return "reset_acknowledgement";
+    case 31: return "query_authority";
+    case 32: return "authority_query_response";
+    case 33: return "abdicate_authority";
+    case 38: return "membership_acknowledgement";
+    case 49: return "high_water_ack";
+    case 52: return "patch_epoch";
+    case 54: return "bubble_activity_host_state";
+    default: return "other";
+    }
+}
+
+/** Emits one line for every client -> activity-host message before any handler touches it. */
+void report_inbound(const service::Request& request, std::uint64_t boundSessionId) noexcept {
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=strike stage=activity_message direction=in type=%u name=%s handle=0x%llX "
+        "bound=0x%llX bytes=%zu",
+        request.messageType,
+        diagnostic_message_name(request.messageType),
+        static_cast<unsigned long long>(request.accountHandle),
+        static_cast<unsigned long long>(boundSessionId),
+        request.payload.size());
+    if (written > 0) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::info,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
+}
+
 /** One row per Client-sent message this route accepts but has no state to change for. */
 struct AcceptedMessage {
     std::uint32_t type;
@@ -170,6 +220,20 @@ void report_message(std::uint32_t messageType,
     plan.joinCharacterSoid = parsed.characterSoid;
     plan.delivery = Delivery::joinNotifications;
     plan.mutationDomain = MutationDomain::entitySlots;
+
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=strike stage=join_request result=prepared session=0x%llX corr=0x%08X character=0x%llX",
+        static_cast<unsigned long long>(parsed.sessionId),
+        parsed.correlation,
+        static_cast<unsigned long long>(parsed.characterSoid));
+    if (written > 0) {
+        core::log::write(core::log::Channel::server,
+                         core::log::Level::info,
+                         {line.data(), static_cast<std::size_t>(written)});
+    }
     return true;
 }
 
@@ -323,6 +387,9 @@ bool process(std::uint64_t boundSessionId,
         report_message(0, 0, "parse");
         return false;
     }
+
+    report_inbound(request, boundSessionId);
+
     // Dispatch is on message type alone, and every handler keys off the envelope's own handle, so
     // nothing has to be bound first. The join request carries the session in the first place, and
     // it arrives on a link that has allocated nothing.
@@ -389,6 +456,26 @@ bool process(std::uint64_t boundSessionId,
         plan = {};
         return true;
     }
+
+    {
+        std::array<char, core::log::kLineCapacity> line{};
+        const int written = std::snprintf(
+            line.data(),
+            line.size(),
+            "ev=strike stage=activity_message result=prepared type=%u name=%s session=0x%llX "
+            "delivery=%u mutation=%u",
+            request.messageType,
+            diagnostic_message_name(request.messageType),
+            static_cast<unsigned long long>(plan.sessionId),
+            static_cast<unsigned>(plan.delivery),
+            static_cast<unsigned>(plan.mutationDomain));
+        if (written > 0) {
+            core::log::write(core::log::Channel::server,
+                             core::log::Level::info,
+                             {line.data(), static_cast<std::size_t>(written)});
+        }
+    }
+
     hasTransaction = true;
     return true;
 }

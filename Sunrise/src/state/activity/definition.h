@@ -11,6 +11,7 @@
 #include "entity_slots/definition.h"
 #include "forced/definition.h"
 #include "membership/definition.h"
+#include "script_state/definition.h"
 
 namespace sunrise::state::activity {
 
@@ -45,6 +46,8 @@ struct SessionRecord {
     membership::MembershipState membership{};
     /** Bubble grant tokens reset with the bounded activity session record. */
     bubble_authority::AuthorityState bubbleAuthority{};
+    /** Server mission progression scoped to this activity session. Client replication is pending. */
+    script_state::State scriptState{};
     std::uint64_t sessionId{};
     /** Join binds this key before any later client identity update can be accepted. */
     std::uint64_t memberKey{};

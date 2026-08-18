@@ -23,6 +23,10 @@ enum class HookSlot : std::size_t {
     contentUntrackedGetter,
     signOnReadinessFailure,
     signOnReadinessReady,
+    msg5ReadBits,
+    msg5ReadWide,
+    msg5ReadBool,
+    msg5StreamStatus,
     count,
 };
 
