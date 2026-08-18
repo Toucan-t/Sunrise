@@ -25,6 +25,7 @@
 #include "../hooks/polled_input/runtime.h"
 #include "../hooks/queuez/queuez_hook_lifecycle.h"
 #include "../hooks/retail_log/retail_log_lifecycle.h"
+#include "../hooks/script_probe/script_probe_lifecycle.h"
 #include "../hooks/spawn/spawn_runtime.h"
 #include "../hooks/teleport/runtime.h"
 #include "../patterns/registry.h"
@@ -149,6 +150,8 @@ void clear_game_targets() noexcept {
                      packageKeys ? "ev=activate stage=package_keys result=ok"
                                  : "ev=activate stage=package_keys result=fail");
     (void)hooks::retail_log::install();
+    // Observation-only Season of Arrivals authored-script probes. A miss never blocks boot.
+    (void)hooks::script_probe::install();
     (void)hooks::assert_handler::install();
     (void)hooks::config_getter::install();
     (void)hooks::bootflow::install();

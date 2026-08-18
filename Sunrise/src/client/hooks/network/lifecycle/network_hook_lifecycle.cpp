@@ -23,19 +23,6 @@ void disable_group(std::span<const HookSlot> slots) noexcept {
     lifecycle::set_accepting(slots, false);
 }
 
-/**
- * Installs the reader observers as a fail-soft diagnostic group. A stale RVA must never prevent
- * Sunrise's ordinary networking hooks from installing; the per-slot attach logs expose a miss.
- */
-void ensure_msg5_diagnostic() noexcept {
-    if (lifecycle::all_installed(lifecycle::kMsg5DiagnosticSlots)
-        || lifecycle::any_installed(lifecycle::kMsg5DiagnosticSlots)) {
-        return;
-    }
-    const lifecycle::Msg5DiagnosticSpecs specs = lifecycle::msg5_diagnostic_specs();
-    (void)lifecycle::install_group(specs, lifecycle::kMsg5DiagnosticSlots);
-}
-
 } // namespace
 
 /** Installs the game-owned HTTP and transport replacements as one unit. */
@@ -47,7 +34,6 @@ bool install_game() noexcept {
         return false;
     }
     if (baseInstalled && content_config::is_installed() && investment::is_installed()) {
-        ensure_msg5_diagnostic();
         ReleaseSRWLockExclusive(&g_lock);
         return true;
     }
@@ -63,9 +49,6 @@ bool install_game() noexcept {
     const lifecycle::GameSpecs specs = lifecycle::game_specs();
     const bool installedBase =
         baseInstalled || lifecycle::install_group(specs, lifecycle::kGameSlots);
-    if (installedBase) {
-        ensure_msg5_diagnostic();
-    }
     const bool installedContent = installedBase && content_config::install();
     const bool installed = installedContent && investment::install();
     if (installed) {
@@ -73,7 +56,6 @@ bool install_game() noexcept {
         (void)external_server::install();
     }
     if (!installed && installedBase) {
-        disable_group(lifecycle::kMsg5DiagnosticSlots);
         disable_group(lifecycle::kGameSlots);
         const bool investmentRemoved = investment::uninstall();
         const bool contentRemoved = !content_config::has_ownership() || content_config::uninstall();
@@ -82,9 +64,6 @@ bool install_game() noexcept {
         forcedRollbackFailure = testing::consume_game_rollback_failure();
 #endif
         if (investmentRemoved && contentRemoved && !forcedRollbackFailure) {
-            const auto diagnosticEntries = lifecycle::msg5_diagnostic_protected_entries();
-            (void)lifecycle::uninstall_group(
-                lifecycle::kMsg5DiagnosticSlots, diagnosticEntries);
             const auto protectedEntries = lifecycle::game_protected_entries();
             (void)lifecycle::uninstall_group(lifecycle::kGameSlots, protectedEntries);
         }
@@ -120,7 +99,6 @@ bool uninstall() noexcept {
 
     AcquireSRWLockExclusive(&g_lock);
     disable_group(lifecycle::kPlatformSlots);
-    disable_group(lifecycle::kMsg5DiagnosticSlots);
     disable_group(lifecycle::kGameSlots);
     ReleaseSRWLockExclusive(&g_lock);
     if (!wait_for_base_idle()) {
@@ -146,13 +124,8 @@ bool uninstall() noexcept {
         ReleaseSRWLockExclusive(&g_lock);
         return false;
     }
-    const auto diagnosticProtectedEntries = lifecycle::msg5_diagnostic_protected_entries();
-    const bool diagnosticRemoved = lifecycle::uninstall_group(
-        lifecycle::kMsg5DiagnosticSlots, diagnosticProtectedEntries);
     const auto gameProtectedEntries = lifecycle::game_protected_entries();
-    const bool removed =
-        diagnosticRemoved
-        && lifecycle::uninstall_group(lifecycle::kGameSlots, gameProtectedEntries);
+    const bool removed = lifecycle::uninstall_group(lifecycle::kGameSlots, gameProtectedEntries);
     ReleaseSRWLockExclusive(&g_lock);
     return removed;
 }
@@ -171,7 +144,6 @@ bool is_game_installed() noexcept {
 bool has_game_ownership() noexcept {
     AcquireSRWLockShared(&g_lock);
     const bool owned = lifecycle::any_installed(lifecycle::kGameSlots)
-                       || lifecycle::any_installed(lifecycle::kMsg5DiagnosticSlots)
                        || content_config::has_ownership() || investment::has_ownership()
                        || coordinator::active_calls() != 0;
     ReleaseSRWLockShared(&g_lock);

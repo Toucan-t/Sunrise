@@ -1,6 +1,4 @@
-#include <Windows.h>
-
-#include <array>
+﻿#include <array>
 
 #include "../../patterns/game.h"
 #include "network.h"
@@ -22,12 +20,6 @@ Targets g_targets;
 constexpr std::size_t kContentIdTokenDisplacementOffset = 14;
 /** The token load's lea ends after its signed rel32. */
 constexpr std::size_t kContentIdTokenInstructionEndOffset = 18;
-
-/** Confirmed Season of Arrivals native bitstream helper RVAs used by the msg-5 diagnostic. */
-constexpr std::size_t kMsg5ReadBitsRva = 0x003513B0;
-constexpr std::size_t kMsg5ReadWideRva = 0x00351070;
-constexpr std::size_t kMsg5ReadBoolRva = 0x00350EF0;
-constexpr std::size_t kMsg5StreamStatusRva = 0x0034E9B0;
 
 } // namespace
 
@@ -61,24 +53,6 @@ bool derive(std::span<const patterns::ImageRange> image,
         matches[index(patterns::game::Id::bubbleAuthorityDecoder)].address;
     resolved.contentUntrackedGetter =
         matches[index(patterns::game::Id::contentUntrackedGetter)].address;
-
-    // These four helpers are pinned-executable diagnostics, not general signatures. An RVA outside
-    // executable memory becomes null so the optional diagnostic group fails closed without
-    // preventing the ordinary networking target table from publishing.
-    auto* const moduleBase = reinterpret_cast<std::byte*>(GetModuleHandleW(nullptr));
-    if (moduleBase == nullptr) {
-        return false;
-    }
-    std::byte* const readBits = moduleBase + kMsg5ReadBitsRva;
-    std::byte* const readWide = moduleBase + kMsg5ReadWideRva;
-    std::byte* const readBool = moduleBase + kMsg5ReadBoolRva;
-    std::byte* const streamStatus = moduleBase + kMsg5StreamStatusRva;
-    resolved.msg5ReadBits = relative::contains(image, readBits) ? readBits : nullptr;
-    resolved.msg5ReadWide = relative::contains(image, readWide) ? readWide : nullptr;
-    resolved.msg5ReadBool = relative::contains(image, readBool) ? readBool : nullptr;
-    resolved.msg5StreamStatus =
-        relative::contains(image, streamStatus) ? streamStatus : nullptr;
-
     std::byte* const contentIdTokenLoad =
         matches[index(patterns::game::Id::contentIdTokenLoad)].address;
     if (!relative::resolve(contentIdTokenLoad,

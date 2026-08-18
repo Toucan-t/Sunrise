@@ -20,16 +20,6 @@ namespace {
     };
 }
 
-/** @return The msg-5 diagnostic reader replacement bodies, in diagnostic-slot order. */
-[[nodiscard]] std::array<void*, kMsg5DiagnosticSlots.size()> msg5_diagnostic_replacements() noexcept {
-    return {
-        bubble_authority::read_bits_entry_point(),
-        bubble_authority::read_wide_entry_point(),
-        bubble_authority::read_bool_entry_point(),
-        bubble_authority::stream_status_entry_point(),
-    };
-}
-
 /** @return The platform replacement bodies, in hook-slot order. */
 [[nodiscard]] std::array<void*, kPlatformSlots.size()> platform_replacements() noexcept {
     return {
@@ -54,18 +44,6 @@ GameSpecs game_specs() noexcept {
     };
 }
 
-/** @return Diagnostic bitstream target and body pairs, in slot order. */
-Msg5DiagnosticSpecs msg5_diagnostic_specs() noexcept {
-    const auto replacements = msg5_diagnostic_replacements();
-    const targets::game::network::Targets& resolved = targets::game::network::get();
-    return {
-        hooking::detour::Spec{resolved.msg5ReadBits, replacements[0]},
-        hooking::detour::Spec{resolved.msg5ReadWide, replacements[1]},
-        hooking::detour::Spec{resolved.msg5ReadBool, replacements[2]},
-        hooking::detour::Spec{resolved.msg5StreamStatus, replacements[3]},
-    };
-}
-
 /** @return Platform target and body pairs, in slot order. */
 PlatformSpecs platform_specs() noexcept {
     const auto replacements = platform_replacements();
@@ -80,18 +58,6 @@ PlatformSpecs platform_specs() noexcept {
 GameProtectedEntries game_protected_entries() noexcept {
     const auto replacements = game_replacements();
     GameProtectedEntries entries{};
-    for (std::size_t index = 0; index < replacements.size(); ++index) {
-        entries[index].address = replacements[index];
-    }
-    entries[replacements.size()].address = coordinator::ingress_entry_point();
-    entries[replacements.size() + 1].address = coordinator::egress_entry_point();
-    return entries;
-}
-
-/** @return The diagnostic reader replacements plus coordinator bodies kept safe at detach. */
-Msg5DiagnosticProtectedEntries msg5_diagnostic_protected_entries() noexcept {
-    const auto replacements = msg5_diagnostic_replacements();
-    Msg5DiagnosticProtectedEntries entries{};
     for (std::size_t index = 0; index < replacements.size(); ++index) {
         entries[index].address = replacements[index];
     }

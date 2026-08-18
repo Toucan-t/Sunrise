@@ -8,10 +8,7 @@ namespace sunrise::client::hooks::network::lifecycle {
 
 using GameSpecs = std::array<hooking::detour::Spec, kGameSlots.size()>;
 using PlatformSpecs = std::array<hooking::detour::Spec, kPlatformSlots.size()>;
-using Msg5DiagnosticSpecs = std::array<hooking::detour::Spec, kMsg5DiagnosticSlots.size()>;
 using GameProtectedEntries = std::array<hooking::detour::ProtectedCodeEntry, kGameSlots.size() + 2>;
-using Msg5DiagnosticProtectedEntries =
-    std::array<hooking::detour::ProtectedCodeEntry, kMsg5DiagnosticSlots.size() + 2>;
 using PlatformProtectedEntries =
     std::array<hooking::detour::ProtectedCodeEntry, kPlatformSlots.size() + 2>;
 
@@ -21,14 +18,8 @@ using PlatformProtectedEntries =
 /** @return Platform target and body pairs, in slot order. */
 [[nodiscard]] PlatformSpecs platform_specs() noexcept;
 
-/** @return Diagnostic bitstream target and body pairs, in slot order. */
-[[nodiscard]] Msg5DiagnosticSpecs msg5_diagnostic_specs() noexcept;
-
 /** @return The game replacement, ingress and egress bodies kept safe at detach. */
 [[nodiscard]] GameProtectedEntries game_protected_entries() noexcept;
-
-/** @return The diagnostic reader replacements plus coordinator bodies kept safe at detach. */
-[[nodiscard]] Msg5DiagnosticProtectedEntries msg5_diagnostic_protected_entries() noexcept;
 
 /** @return The platform replacement, ingress and egress bodies kept safe at detach. */
 [[nodiscard]] PlatformProtectedEntries platform_protected_entries() noexcept;

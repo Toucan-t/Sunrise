@@ -1,0 +1,1307 @@
+#include "script_probe_lifecycle.h"
+
+#include <Windows.h>
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string_view>
+
+#include "../../../core/logging/log.h"
+#include "../../../state/activity/runtime.h"
+#include "../../diagnostics/module_range.h"
+#include "../../hooking/detour.h"
+#include "../../patterns/image_scan.h"
+
+namespace sunrise::client::hooks::script_probe {
+namespace {
+
+/**
+ * Focused Season of Arrivals client-launch probes. Every target below is either a verified function
+ * entry RVA or a unique function-entry signature from the client documentation. The previous
+ * diagnostic's mid-function hook at 0x0175EF59 is intentionally gone: internal branch targets are
+ * not safe Detours entries.
+ *
+ * The question for this pass is upstream of server activity state: does Destiny arm its own local
+ * ActivityLaunchBlock for the selected Garden World launch before identity 1 falls into local mode 6?
+ */
+enum class TargetKind : std::uint8_t {
+    fixedRva,
+    activityLaunchTick,
+    applySetSelection,
+    raiseGroupGoal,
+};
+
+struct SiteDefinition final {
+    const char* name{};
+    std::uint32_t rva{};
+    TargetKind targetKind{TargetKind::fixedRva};
+    bool deduplicate{};
+    bool probeLaunchProperty{};
+    bool probeIdentityObject{};
+};
+
+using patterns::scan_main_image_unique;
+using patterns::signature;
+using patterns::signature_length;
+
+/** Unique function-entry signatures recovered in d2-client-docs/refs/appendix/symbols.md. */
+inline constexpr std::string_view kActivityLaunchTickSignatureText =
+    "48 89 5C 24 ? 57 48 83 EC 20 48 8B F9 E8 ? ? ? ? 33 C9";
+inline constexpr auto kActivityLaunchTickSignature =
+    signature<signature_length(kActivityLaunchTickSignatureText)>(kActivityLaunchTickSignatureText);
+
+inline constexpr std::string_view kApplySetSelectionSignatureText =
+    "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 81 EC 60 0A 00 00";
+inline constexpr auto kApplySetSelectionSignature =
+    signature<signature_length(kApplySetSelectionSignatureText)>(kApplySetSelectionSignatureText);
+
+inline constexpr std::string_view kRaiseGroupGoalSignatureText =
+    "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC 50 44 0F B7 42";
+inline constexpr auto kRaiseGroupGoalSignature =
+    signature<signature_length(kRaiseGroupGoalSignatureText)>(kRaiseGroupGoalSignatureText);
+
+constexpr std::array<SiteDefinition, 13> kSites{{
+    // Client-owned launch machine. Pattern sites are function entries, not interior basic blocks.
+    {"activity_launch_tick", 0, TargetKind::activityLaunchTick, true, true, false},
+    {"selection_apply", 0, TargetKind::applySetSelection, false, true, false},
+    {"selection_raise_goal", 0, TargetKind::raiseGroupGoal, false, true, false},
+    // Authored launch path. If the local launch never drives this, the backend cannot create it.
+    {"authored_dispatcher", 0x0134FDF0U, TargetKind::fixedRva, false, false, false},
+    {"selection_ingest", 0x0175B8F0U, TargetKind::fixedRva, false, false, false},
+    {"authored_input", 0x017AB350U, TargetKind::fixedRva, false, false, false},
+    {"local_route_ctor", 0x01757600U, TargetKind::fixedRva, false, false, false},
+    {"authored_route_ctor", 0x01757C00U, TargetKind::fixedRva, false, false, false},
+    {"selection_pump", 0x0175E520U, TargetKind::fixedRva, true, false, false},
+    // Manager/result correlation. All remain observation-only.
+    {"local_manager_init", 0x01772440U, TargetKind::fixedRva, false, false, true},
+    {"authored_manager_init", 0x01773200U, TargetKind::fixedRva, false, false, true},
+    {"receiver_create", 0x017B8C50U, TargetKind::fixedRva, false, false, true},
+    {"component_dispatch", 0x01766A30U, TargetKind::fixedRva, false, false, false},
+}};
+
+constexpr std::size_t kRuntimeSiteCount = kSites.size();
+constexpr std::size_t kSignatureSlots = 32;
+constexpr std::uint32_t kPreSessionDetailLimit = 12;
+constexpr std::uint32_t kSessionDetailLimit = 24;
+constexpr std::size_t kThunkAllocationSize = 0x400;
+constexpr DWORD kUnwindInfoOffset = 0x200;
+constexpr DWORD kThunkCodeLimit = 0x1F0;
+
+/** Recovered client-owned activity-selection property layout from the client infrastructure docs. */
+constexpr std::size_t kSelectionPropertyFlagsOffset = 320;
+constexpr std::size_t kSelectionPropertyAuthoritativeOffset = 328;
+constexpr std::size_t kSelectionRecordSize = 3040;
+constexpr std::size_t kSelectionRecordActiveSlotOffset = 2600;
+constexpr std::size_t kSelectionRecordLaunchOffset = 2608;
+constexpr std::size_t kLaunchSelectionOffset = 8;
+constexpr std::size_t kLaunchStartMsOffset = 288;
+constexpr std::size_t kLaunchCountdownMsOffset = 296;
+constexpr std::size_t kLaunchRemainingMsOffset = 300;
+constexpr std::size_t kSelectionMemberCount = 12;
+constexpr std::size_t kLaunchOwnerScanBytes = 0x400;
+constexpr std::uint64_t kLaunchSampleIntervalMs = 100;
+constexpr std::size_t kManagerIdentityOffset = 0x854;
+/**
+ * Stack frame generated by the ABI-neutral thunk after `sub rsp, 0xD8`.
+ * Offsets are part of the generated machine-code contract below.
+ */
+constexpr std::size_t kFrameXmm0 = 0x20;
+constexpr std::size_t kFrameRax = 0x80;
+constexpr std::size_t kFrameRcx = 0x88;
+constexpr std::size_t kFrameRdx = 0x90;
+constexpr std::size_t kFrameR8 = 0x98;
+constexpr std::size_t kFrameR9 = 0xA0;
+constexpr std::size_t kFrameR10 = 0xA8;
+constexpr std::size_t kFrameR11 = 0xB0;
+constexpr std::size_t kFrameOriginalRsp = 0xB8;
+constexpr std::size_t kFrameFlags = 0xC0;
+constexpr std::size_t kFrameAllocation = 0xD8;
+
+struct SiteRuntime final {
+    hooking::detour::Handle hook{};
+    RUNTIME_FUNCTION runtimeFunction{};
+    std::atomic_uint32_t hits{0};
+    std::atomic_uint32_t sessionHits{0};
+    std::atomic_uint32_t preSessionDetail{0};
+    std::atomic_uint32_t sessionDetail{0};
+    std::atomic_uint32_t loggedHits{0};
+    std::array<std::atomic_uint64_t, kSignatureSlots> preSessionSignatures{};
+    std::array<std::atomic_uint64_t, kSignatureSlots> sessionSignatures{};
+    void* thunk{};
+    std::uintptr_t* trampolineSlot{};
+    std::size_t thunkCodeSize{};
+    std::uint32_t resolvedRva{};
+    bool functionTableRegistered{};
+};
+
+std::array<SiteRuntime, kRuntimeSiteCount> g_runtime{};
+std::atomic_bool g_installed{false};
+diagnostics::ModuleRange g_gameRange{};
+std::atomic_uintptr_t g_launchProperty{0};
+std::atomic_uintptr_t g_launchPropertyOwner{0};
+std::atomic_uint64_t g_lastLaunchSampleMs{0};
+std::atomic_uint64_t g_lastLaunchSignature{0};
+
+[[nodiscard]] const SiteDefinition& site_definition(std::size_t index) noexcept {
+    return kSites[index];
+}
+
+[[nodiscard]] const char* target_kind_name(TargetKind kind) noexcept {
+    switch (kind) {
+    case TargetKind::fixedRva:
+        return "rva";
+    case TargetKind::activityLaunchTick:
+    case TargetKind::applySetSelection:
+    case TargetKind::raiseGroupGoal:
+        return "pattern";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] std::byte* resolve_site_target(std::size_t index, HMODULE game) noexcept {
+    const SiteDefinition& site = site_definition(index);
+    switch (site.targetKind) {
+    case TargetKind::fixedRva:
+        return reinterpret_cast<std::byte*>(game) + site.rva;
+    case TargetKind::activityLaunchTick:
+        return scan_main_image_unique(kActivityLaunchTickSignature, site.name);
+    case TargetKind::applySetSelection:
+        return scan_main_image_unique(kApplySetSelectionSignature, site.name);
+    case TargetKind::raiseGroupGoal:
+        return scan_main_image_unique(kRaiseGroupGoalSignature, site.name);
+    }
+    return nullptr;
+}
+
+[[nodiscard]] bool executable_address(void* address) noexcept {
+    MEMORY_BASIC_INFORMATION memory{};
+    if (address == nullptr || VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory)
+        || memory.State != MEM_COMMIT) {
+        return false;
+    }
+    constexpr DWORD kPageTypeMask = 0xFF;
+    switch (memory.Protect & kPageTypeMask) {
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+template <typename T>
+[[nodiscard]] T frame_value(const std::byte* frame, std::size_t offset) noexcept {
+    T value{};
+    std::memcpy(&value, frame + offset, sizeof value);
+    return value;
+}
+
+template <typename T>
+[[nodiscard]] bool read_remote(std::uintptr_t address, std::size_t offset, T& output) noexcept {
+    output = {};
+    if (address == 0) {
+        return false;
+    }
+    SIZE_T copied{};
+    return ReadProcessMemory(GetCurrentProcess(),
+                             reinterpret_cast<const void*>(address + offset),
+                             &output,
+                             sizeof output,
+                             &copied)
+               != FALSE
+           && copied == sizeof output;
+}
+
+[[nodiscard]] bool read_remote_bytes(std::uintptr_t address,
+                                     std::size_t offset,
+                                     void* output,
+                                     std::size_t size) noexcept {
+    if (address == 0 || output == nullptr || size == 0) {
+        return false;
+    }
+    SIZE_T copied{};
+    return ReadProcessMemory(GetCurrentProcess(),
+                             reinterpret_cast<const void*>(address + offset),
+                             output,
+                             size,
+                             &copied)
+               != FALSE
+           && copied == size;
+}
+
+[[nodiscard]] bool newest_session(state::activity::JoinedSessionSnapshot& output) noexcept {
+    output = {};
+    state::activity::JoinedSessionSnapshots snapshots{};
+    const std::size_t count = state::activity::joined_sessions_snapshot(snapshots);
+    bool found = false;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!found || snapshots[index].context.sessionId > output.context.sessionId) {
+            output = snapshots[index];
+            found = true;
+        }
+    }
+    return found;
+}
+
+[[nodiscard]] std::uint64_t caller_rva(std::uintptr_t returnAddress, bool& inGame) noexcept {
+    inGame = diagnostics::contains(g_gameRange, returnAddress);
+    return inGame ? static_cast<std::uint64_t>(returnAddress - g_gameRange.base) : 0;
+}
+
+[[nodiscard]] std::uint64_t mix_signature(std::uint64_t value) noexcept {
+    value ^= value >> 30U;
+    value *= 0xBF58476D1CE4E5B9ULL;
+    value ^= value >> 27U;
+    value *= 0x94D049BB133111EBULL;
+    value ^= value >> 31U;
+    return value;
+}
+
+[[nodiscard]] std::uint64_t call_signature(std::uintptr_t returnAddress,
+                                           std::uintptr_t rcx,
+                                           std::uintptr_t rdx,
+                                           std::uintptr_t r8,
+                                           std::uintptr_t r9) noexcept {
+    const std::uint64_t signature = mix_signature(returnAddress)
+                                    ^ mix_signature(rcx + 0x9E3779B97F4A7C15ULL)
+                                    ^ mix_signature(rdx + 0xD1B54A32D192ED03ULL)
+                                    ^ mix_signature(r8 + 0x94D049BB133111EBULL)
+                                    ^ mix_signature(r9 + 0xBF58476D1CE4E5B9ULL);
+    return signature == 0 ? 1 : signature;
+}
+
+[[nodiscard]] bool claim_signature(
+    std::array<std::atomic_uint64_t, kSignatureSlots>& signatures,
+    std::uint64_t signature) noexcept {
+    for (std::atomic_uint64_t& slot : signatures) {
+        std::uint64_t current = slot.load(std::memory_order_relaxed);
+        if (current == signature) {
+            return false;
+        }
+        if (current == 0
+            && slot.compare_exchange_strong(
+                current, signature, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return true;
+        }
+        if (current == signature) {
+            return false;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool count_milestone(std::uint32_t value) noexcept {
+    return value >= 16U && (value & (value - 1U)) == 0U;
+}
+
+struct LaunchRecordSample final {
+    std::int8_t activeSlot{-1};
+    std::uint8_t version{};
+    std::uint8_t slotKind{};
+    std::uint8_t reason{};
+    std::int8_t state{};
+    std::uint8_t snapTransition{};
+    std::uint8_t snapManager{};
+    std::uint8_t selectionKind{};
+    std::uint16_t selectionCountdown{};
+    std::int64_t startMs{-1};
+    std::int32_t countdownMs{};
+    std::int32_t remainingMs{};
+    bool readable{};
+};
+
+[[nodiscard]] LaunchRecordSample read_launch_record(std::uintptr_t property,
+                                                    std::size_t memberIndex) noexcept {
+    LaunchRecordSample sample{};
+    if (property == 0 || memberIndex >= kSelectionMemberCount) {
+        return sample;
+    }
+    const std::uintptr_t record = property + kSelectionPropertyAuthoritativeOffset
+                                  + memberIndex * kSelectionRecordSize;
+    const std::uintptr_t launch = record + kSelectionRecordLaunchOffset;
+    std::array<std::uint8_t, 8> head{};
+    if (!read_remote(record, kSelectionRecordActiveSlotOffset, sample.activeSlot)
+        || !read_remote_bytes(launch, 0, head.data(), head.size())
+        || !read_remote(launch, kLaunchSelectionOffset, sample.selectionKind)
+        || !read_remote(launch, kLaunchSelectionOffset + 4, sample.selectionCountdown)
+        || !read_remote(launch, kLaunchStartMsOffset, sample.startMs)
+        || !read_remote(launch, kLaunchCountdownMsOffset, sample.countdownMs)
+        || !read_remote(launch, kLaunchRemainingMsOffset, sample.remainingMs)) {
+        return sample;
+    }
+    sample.version = head[0];
+    sample.slotKind = head[1];
+    sample.reason = head[2];
+    std::memcpy(&sample.state, &head[3], sizeof sample.state);
+    sample.snapTransition = head[4];
+    sample.snapManager = head[5];
+    sample.readable = true;
+    return sample;
+}
+
+[[nodiscard]] bool plausible_launch_record(const LaunchRecordSample& sample) noexcept {
+    if (!sample.readable || sample.activeSlot < -1 || sample.activeSlot > 8 || sample.state < -1
+        || sample.state > 4 || sample.reason > 0x3FU || sample.slotKind > 0x40U
+        || sample.selectionKind > 0x40U) {
+        return false;
+    }
+    constexpr std::int32_t kMaxCountdownMs = 15 * 60 * 1000;
+    if (sample.countdownMs < -1 || sample.countdownMs > kMaxCountdownMs
+        || sample.remainingMs < -kMaxCountdownMs || sample.remainingMs > kMaxCountdownMs) {
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool plausible_launch_property(std::uintptr_t property, std::uint8_t* flagsOut) noexcept {
+    std::uintptr_t vtable{};
+    std::uintptr_t session{};
+    std::uint8_t flags{};
+    std::uintptr_t sessionHead{};
+    if (!read_remote(property, 0, vtable) || !executable_address(reinterpret_cast<void*>(vtable))
+        || !read_remote(property, 24, session) || session == 0
+        || !read_remote(session, 0, sessionHead)
+        || !read_remote(property, kSelectionPropertyFlagsOffset, flags) || (flags & 0xFCU) != 0) {
+        return false;
+    }
+    for (std::size_t member = 0; member < kSelectionMemberCount; ++member) {
+        if (!plausible_launch_record(read_launch_record(property, member))) {
+            return false;
+        }
+    }
+    if (flagsOut != nullptr) {
+        *flagsOut = flags;
+    }
+    return true;
+}
+
+struct LaunchPropertyCandidate final {
+    std::uintptr_t property{};
+    std::size_t pointerOffset{};
+    bool direct{};
+};
+
+[[nodiscard]] LaunchPropertyCandidate find_launch_property(std::uintptr_t owner) noexcept {
+    LaunchPropertyCandidate output{};
+    if (owner < 0x10000U) {
+        return output;
+    }
+    if (plausible_launch_property(owner, nullptr)) {
+        output.property = owner;
+        output.direct = true;
+        return output;
+    }
+
+    std::array<std::byte, kLaunchOwnerScanBytes> bytes{};
+    if (!read_remote_bytes(owner, 0, bytes.data(), bytes.size())) {
+        return output;
+    }
+    for (std::size_t offset = 0; offset + sizeof(std::uintptr_t) <= bytes.size();
+         offset += sizeof(std::uintptr_t)) {
+        std::uintptr_t candidate{};
+        std::memcpy(&candidate, bytes.data() + offset, sizeof candidate);
+        if (candidate < 0x10000U || candidate == owner) {
+            continue;
+        }
+        if (plausible_launch_property(candidate, nullptr)) {
+            output.property = candidate;
+            output.pointerOffset = offset;
+            return output;
+        }
+    }
+    return output;
+}
+
+void report_launch_property_bind(std::uint32_t siteIndex,
+                                 std::uint32_t hit,
+                                 const char* argument,
+                                 std::uintptr_t owner,
+                                 const LaunchPropertyCandidate& candidate) noexcept {
+    std::uint8_t flags{};
+    (void)read_remote(candidate.property, kSelectionPropertyFlagsOffset, flags);
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = candidate.direct
+                            ? std::snprintf(line.data(),
+                                            line.size(),
+                                            "ev=script_native stage=launch_property_bind site=%s n=%u "
+                                            "arg=%s owner=0x%llX property=0x%llX via=direct flags=0x%02X",
+                                            site_definition(siteIndex).name,
+                                            hit,
+                                            argument,
+                                            static_cast<unsigned long long>(owner),
+                                            static_cast<unsigned long long>(candidate.property),
+                                            flags)
+                            : std::snprintf(line.data(),
+                                            line.size(),
+                                            "ev=script_native stage=launch_property_bind site=%s n=%u "
+                                            "arg=%s owner=0x%llX property=0x%llX via=ptr+0x%zX flags=0x%02X",
+                                            site_definition(siteIndex).name,
+                                            hit,
+                                            argument,
+                                            static_cast<unsigned long long>(owner),
+                                            static_cast<unsigned long long>(candidate.property),
+                                            candidate.pointerOffset,
+                                            flags);
+    if (written > 0) {
+        const auto length = static_cast<std::size_t>(written) < line.size()
+                                ? static_cast<std::size_t>(written)
+                                : line.size() - 1;
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::info,
+                         std::string_view(line.data(), length));
+    }
+}
+
+void try_bind_launch_property(std::uint32_t siteIndex,
+                              std::uint32_t hit,
+                              const std::array<std::pair<const char*, std::uintptr_t>, 4>& args) noexcept {
+    if (g_launchProperty.load(std::memory_order_acquire) != 0 || hit > 8U) {
+        return;
+    }
+    const std::size_t argumentLimit =
+        site_definition(siteIndex).targetKind == TargetKind::activityLaunchTick ? 1U : 2U;
+    for (std::size_t index = 0; index < argumentLimit; ++index) {
+        const auto& [name, owner] = args[index];
+        const LaunchPropertyCandidate candidate = find_launch_property(owner);
+        if (candidate.property == 0) {
+            continue;
+        }
+        std::uintptr_t expected{};
+        if (g_launchProperty.compare_exchange_strong(
+                expected, candidate.property, std::memory_order_release, std::memory_order_relaxed)) {
+            g_launchPropertyOwner.store(owner, std::memory_order_release);
+            g_lastLaunchSignature.store(0, std::memory_order_release);
+            g_lastLaunchSampleMs.store(0, std::memory_order_release);
+            report_launch_property_bind(siteIndex, hit, name, owner, candidate);
+        }
+        return;
+    }
+}
+
+[[nodiscard]] std::uint64_t launch_state_signature(std::uint8_t flags,
+                                                   const std::array<LaunchRecordSample,
+                                                                    kSelectionMemberCount>& records) noexcept {
+    std::uint64_t signature = mix_signature(flags + 1U);
+    for (std::size_t member = 0; member < records.size(); ++member) {
+        const LaunchRecordSample& sample = records[member];
+        std::uint64_t packed = static_cast<std::uint8_t>(sample.activeSlot);
+        packed |= static_cast<std::uint64_t>(sample.version) << 8U;
+        packed |= static_cast<std::uint64_t>(sample.slotKind) << 16U;
+        packed |= static_cast<std::uint64_t>(sample.reason) << 24U;
+        packed |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(sample.state)) << 32U;
+        packed |= static_cast<std::uint64_t>(sample.selectionKind) << 40U;
+        packed |= static_cast<std::uint64_t>(sample.selectionCountdown) << 48U;
+        signature ^= mix_signature(packed + member * 0x9E3779B97F4A7C15ULL);
+    }
+    return signature == 0 ? 1 : signature;
+}
+
+void sample_launch_property(std::uint32_t siteIndex, std::uint32_t hit, bool force) noexcept {
+    const std::uintptr_t property = g_launchProperty.load(std::memory_order_acquire);
+    if (property == 0) {
+        return;
+    }
+
+    const std::uint64_t now = GetTickCount64();
+    if (!force) {
+        std::uint64_t previous = g_lastLaunchSampleMs.load(std::memory_order_relaxed);
+        if (previous != 0 && now - previous < kLaunchSampleIntervalMs) {
+            return;
+        }
+        if (!g_lastLaunchSampleMs.compare_exchange_strong(previous, now, std::memory_order_relaxed)) {
+            return;
+        }
+    } else {
+        g_lastLaunchSampleMs.store(now, std::memory_order_relaxed);
+    }
+
+    std::uint8_t flags{};
+    if (!plausible_launch_property(property, &flags)) {
+        g_launchProperty.store(0, std::memory_order_release);
+        g_launchPropertyOwner.store(0, std::memory_order_release);
+        g_lastLaunchSignature.store(0, std::memory_order_release);
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::warn,
+                         "ev=script_native stage=launch_property result=lost");
+        return;
+    }
+
+    std::array<LaunchRecordSample, kSelectionMemberCount> records{};
+    unsigned armed = 0;
+    for (std::size_t member = 0; member < records.size(); ++member) {
+        records[member] = read_launch_record(property, member);
+        if (records[member].reason != 0) {
+            ++armed;
+        }
+    }
+    const std::uint64_t signature = launch_state_signature(flags, records);
+    const std::uint64_t previousSignature =
+        g_lastLaunchSignature.exchange(signature, std::memory_order_acq_rel);
+    if (!force && previousSignature == signature) {
+        return;
+    }
+
+    std::array<char, core::log::kLineCapacity> line{};
+    int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=script_native stage=launch_state site=%s n=%u property=0x%llX owner=0x%llX "
+        "flags=0x%02X armed=%u changed=%u",
+        site_definition(siteIndex).name,
+        hit,
+        static_cast<unsigned long long>(property),
+        static_cast<unsigned long long>(g_launchPropertyOwner.load(std::memory_order_relaxed)),
+        flags,
+        armed,
+        previousSignature != signature ? 1U : 0U);
+    if (written > 0) {
+        const auto length = static_cast<std::size_t>(written) < line.size()
+                                ? static_cast<std::size_t>(written)
+                                : line.size() - 1;
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::info,
+                         std::string_view(line.data(), length));
+    }
+
+    for (std::size_t member = 0; member < records.size(); ++member) {
+        const LaunchRecordSample& sample = records[member];
+        if (sample.reason == 0 && sample.state == 0 && sample.version == 0
+            && sample.activeSlot < 0) {
+            continue;
+        }
+        written = std::snprintf(
+            line.data(),
+            line.size(),
+            "ev=script_native stage=launch_record member=%zu active_slot=%d version=%u slot_kind=%u "
+            "reason=%u state=%d snap_transition=%u snap_manager=%u selection_kind=%u "
+            "selection_countdown=%u start_ms=%lld countdown_ms=%d remaining_ms=%d",
+            member,
+            static_cast<int>(sample.activeSlot),
+            sample.version,
+            sample.slotKind,
+            sample.reason,
+            static_cast<int>(sample.state),
+            sample.snapTransition,
+            sample.snapManager,
+            sample.selectionKind,
+            sample.selectionCountdown,
+            static_cast<long long>(sample.startMs),
+            sample.countdownMs,
+            sample.remainingMs);
+        if (written > 0) {
+            const auto length = static_cast<std::size_t>(written) < line.size()
+                                    ? static_cast<std::size_t>(written)
+                                    : line.size() - 1;
+            core::log::write(core::log::Channel::client,
+                             core::log::Level::info,
+                             std::string_view(line.data(), length));
+        }
+    }
+}
+
+/** Reports the recovered manager identity field at +0x854 for local/authored object creation. */
+void report_identity_object(std::uint32_t siteIndex,
+                            std::uint32_t hit,
+                            const char* argument,
+                            std::uintptr_t base) noexcept {
+    std::uintptr_t vtable{};
+    std::uint32_t identity{};
+    if (!read_remote(base, 0, vtable) || !read_remote(base, kManagerIdentityOffset, identity)) {
+        return;
+    }
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=script_native stage=identity site=%s n=%u arg=%s address=0x%llX vtable=0x%llX "
+        "identity_u32=%u identity_u8=%u expected_identity=%u",
+        site_definition(siteIndex).name,
+        hit,
+        argument,
+        static_cast<unsigned long long>(base),
+        static_cast<unsigned long long>(vtable),
+        identity,
+        identity & 0xFFU,
+        identity <= 2U ? 1U : 0U);
+    if (written > 0) {
+        const auto length = static_cast<std::size_t>(written) < line.size()
+                                ? static_cast<std::size_t>(written)
+                                : line.size() - 1;
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::info,
+                         std::string_view(line.data(), length));
+    }
+}
+
+void report_count(std::uint32_t siteIndex,
+                  std::uint32_t total,
+                  std::uint32_t sessionHits,
+                  const state::activity::JoinedSessionSnapshot* session) noexcept {
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=script_native stage=count site=%s total=%u session_hits=%u session=0x%llX "
+        "activity=%d region=%d script_state=%u revision=%llu",
+        site_definition(siteIndex).name,
+        total,
+        sessionHits,
+        static_cast<unsigned long long>(session != nullptr ? session->context.sessionId : 0),
+        session != nullptr ? static_cast<int>(session->activityIndex) : -1,
+        session != nullptr ? session->context.regionIndex
+                           : state::activity::membership::kAbsentRegionIndex,
+        session != nullptr ? session->scriptState : 0U,
+        static_cast<unsigned long long>(session != nullptr ? session->scriptStateRevision : 0));
+    if (written > 0) {
+        const auto length = static_cast<std::size_t>(written) < line.size()
+                                ? static_cast<std::size_t>(written)
+                                : line.size() - 1;
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::info,
+                         std::string_view(line.data(), length));
+    }
+}
+
+extern "C" void __fastcall sunrise_script_probe_capture(std::uint32_t siteIndex,
+                                                         const std::byte* frame,
+                                                         std::uintptr_t originalRsp,
+                                                         std::uintptr_t returnAddress) noexcept {
+    if (siteIndex >= kRuntimeSiteCount || frame == nullptr) {
+        return;
+    }
+
+    SiteRuntime& runtime = g_runtime[siteIndex];
+    const SiteDefinition& site = site_definition(siteIndex);
+    const std::uint32_t hit = runtime.hits.fetch_add(1, std::memory_order_relaxed) + 1U;
+    const std::uintptr_t rcx = frame_value<std::uintptr_t>(frame, kFrameRcx);
+    const std::uintptr_t rdx = frame_value<std::uintptr_t>(frame, kFrameRdx);
+    const std::uintptr_t r8 = frame_value<std::uintptr_t>(frame, kFrameR8);
+    const std::uintptr_t r9 = frame_value<std::uintptr_t>(frame, kFrameR9);
+    const std::uintptr_t rax = frame_value<std::uintptr_t>(frame, kFrameRax);
+
+    state::activity::JoinedSessionSnapshot session{};
+    const bool hasSession = newest_session(session);
+    if (hasSession) {
+        (void)runtime.sessionHits.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const std::array<std::pair<const char*, std::uintptr_t>, 4> args{{
+        {"rcx", rcx}, {"rdx", rdx}, {"r8", r8}, {"r9", r9}}};
+    if (site.probeLaunchProperty) {
+        try_bind_launch_property(siteIndex, hit, args);
+        sample_launch_property(
+            siteIndex, hit, site.targetKind != TargetKind::activityLaunchTick);
+    }
+
+    bool shouldLog = false;
+    if (site.deduplicate) {
+        const std::uint64_t signature = call_signature(returnAddress, rcx, rdx, r8, r9);
+        auto& signatures = hasSession ? runtime.sessionSignatures : runtime.preSessionSignatures;
+        shouldLog = claim_signature(signatures, signature);
+    } else if (hasSession) {
+        const std::uint32_t ordinal =
+            runtime.sessionDetail.fetch_add(1, std::memory_order_relaxed) + 1U;
+        shouldLog = ordinal <= kSessionDetailLimit;
+    } else {
+        const std::uint32_t ordinal =
+            runtime.preSessionDetail.fetch_add(1, std::memory_order_relaxed) + 1U;
+        shouldLog = ordinal <= kPreSessionDetailLimit;
+    }
+
+    if (!shouldLog) {
+        if (count_milestone(hit)) {
+            report_count(siteIndex,
+                         hit,
+                         runtime.sessionHits.load(std::memory_order_relaxed),
+                         hasSession ? &session : nullptr);
+        }
+        return;
+    }
+
+    const std::uint32_t logged =
+        runtime.loggedHits.fetch_add(1, std::memory_order_relaxed) + 1U;
+    bool callerInGame{};
+    const std::uint64_t caller = caller_rva(returnAddress, callerInGame);
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=script_native stage=hit site=%s n=%u logged=%u ms=%llu target=+0x%08X "
+        "caller=%s0x%llX session=0x%llX activity=%d region=%d script_state=%u revision=%llu "
+        "rax=0x%llX rcx=0x%llX rdx=0x%llX r8=0x%llX r9=0x%llX rsp=0x%llX",
+        site.name,
+        hit,
+        logged,
+        static_cast<unsigned long long>(GetTickCount64()),
+        runtime.resolvedRva,
+        callerInGame ? "+" : "",
+        static_cast<unsigned long long>(callerInGame ? caller : returnAddress),
+        static_cast<unsigned long long>(hasSession ? session.context.sessionId : 0),
+        hasSession ? static_cast<int>(session.activityIndex) : -1,
+        hasSession ? session.context.regionIndex : state::activity::membership::kAbsentRegionIndex,
+        hasSession ? session.scriptState : 0U,
+        static_cast<unsigned long long>(hasSession ? session.scriptStateRevision : 0),
+        static_cast<unsigned long long>(rax),
+        static_cast<unsigned long long>(rcx),
+        static_cast<unsigned long long>(rdx),
+        static_cast<unsigned long long>(r8),
+        static_cast<unsigned long long>(r9),
+        static_cast<unsigned long long>(originalRsp));
+    if (written > 0) {
+        const auto length = static_cast<std::size_t>(written) < line.size()
+                                ? static_cast<std::size_t>(written)
+                                : line.size() - 1;
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::info,
+                         std::string_view(line.data(), length));
+    }
+
+    if (site.probeIdentityObject) {
+        // RCX is the manager/receiver object for all currently confirmed init entries. RDX is kept
+        // as a secondary candidate because the exact receiver ABI is still observational.
+        report_identity_object(siteIndex, hit, "rcx", rcx);
+        report_identity_object(siteIndex, hit, "rdx", rdx);
+    }
+}
+
+/** Appends one byte to a generated thunk. */
+[[nodiscard]] bool emit8(std::byte* code,
+                         std::size_t capacity,
+                         std::size_t& cursor,
+                         std::uint8_t value) noexcept {
+    if (cursor >= capacity) {
+        return false;
+    }
+    code[cursor++] = static_cast<std::byte>(value);
+    return true;
+}
+
+/** Appends one little-endian scalar to a generated thunk. */
+template <typename T>
+[[nodiscard]] bool emit_value(std::byte* code,
+                              std::size_t capacity,
+                              std::size_t& cursor,
+                              T value) noexcept {
+    if (cursor > capacity || sizeof value > capacity - cursor) {
+        return false;
+    }
+    std::memcpy(code + cursor, &value, sizeof value);
+    cursor += sizeof value;
+    return true;
+}
+
+/** Emits a fixed byte sequence. */
+template <std::size_t N>
+[[nodiscard]] bool emit_bytes(std::byte* code,
+                              std::size_t capacity,
+                              std::size_t& cursor,
+                              const std::array<std::uint8_t, N>& bytes) noexcept {
+    for (const std::uint8_t value : bytes) {
+        if (!emit8(code, capacity, cursor, value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Emits `mov [rsp+disp32], register` for the volatile integer register set used below. */
+[[nodiscard]] bool emit_store_rsp(std::byte* code,
+                                  std::size_t capacity,
+                                  std::size_t& cursor,
+                                  std::array<std::uint8_t, 4> opcode,
+                                  std::uint32_t displacement) noexcept {
+    return emit_bytes(code, capacity, cursor, opcode)
+           && emit_value(code, capacity, cursor, displacement);
+}
+
+/** Emits `mov register, [rsp+disp32]` for restore. */
+[[nodiscard]] bool emit_load_rsp(std::byte* code,
+                                 std::size_t capacity,
+                                 std::size_t& cursor,
+                                 std::array<std::uint8_t, 4> opcode,
+                                 std::uint32_t displacement) noexcept {
+    return emit_store_rsp(code, capacity, cursor, opcode, displacement);
+}
+
+/** Emits the 6-byte MOVDQU stack form used for XMM0-XMM5. */
+[[nodiscard]] bool emit_xmm(std::byte* code,
+                            std::size_t capacity,
+                            std::size_t& cursor,
+                            bool load,
+                            std::uint8_t modrm,
+                            std::uint8_t displacement) noexcept {
+    return emit8(code, capacity, cursor, 0xF3)
+           && emit8(code, capacity, cursor, 0x0F)
+           && emit8(code, capacity, cursor, load ? 0x6F : 0x7F)
+           && emit8(code, capacity, cursor, modrm) && emit8(code, capacity, cursor, 0x24)
+           && emit8(code, capacity, cursor, displacement);
+}
+
+/**
+ * Builds one x64 entry probe. The generated function has one prologue allocation described by a
+ * dynamic unwind record, saves every volatile argument register, calls the C++ observer, restores
+ * the original machine state, then tail-jumps through an embedded Detours-trampoline pointer.
+ */
+[[nodiscard]] bool build_thunk(std::uint32_t siteIndex, SiteRuntime& runtime) noexcept {
+    auto* const allocation = static_cast<std::byte*>(VirtualAlloc(nullptr,
+                                                                  kThunkAllocationSize,
+                                                                  MEM_COMMIT | MEM_RESERVE,
+                                                                  PAGE_EXECUTE_READWRITE));
+    if (allocation == nullptr) {
+        return false;
+    }
+    std::memset(allocation, 0xCC, kThunkAllocationSize);
+    std::size_t cursor = 0;
+
+    // sub rsp, 0xD8 -- keeps the Windows x64 call site 16-byte aligned.
+    bool ok = emit_bytes(allocation,
+                         kThunkCodeLimit,
+                         cursor,
+                         std::array<std::uint8_t, 3>{0x48, 0x81, 0xEC})
+              && emit_value(allocation,
+                            kThunkCodeLimit,
+                            cursor,
+                            static_cast<std::uint32_t>(kFrameAllocation));
+
+    // Preserve integer argument/volatile registers in a private frame.
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x48, 0x89, 0x84, 0x24},
+                              static_cast<std::uint32_t>(kFrameRax));
+    // Preserve entry RFLAGS too. The readiness spin below may touch flags before the tail jump.
+    ok = ok && emit8(allocation, kThunkCodeLimit, cursor, 0x9C)
+         && emit8(allocation, kThunkCodeLimit, cursor, 0x58)
+         && emit_store_rsp(allocation,
+                           kThunkCodeLimit,
+                           cursor,
+                           {0x48, 0x89, 0x84, 0x24},
+                           static_cast<std::uint32_t>(kFrameFlags));
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x48, 0x89, 0x8C, 0x24},
+                              static_cast<std::uint32_t>(kFrameRcx));
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x48, 0x89, 0x94, 0x24},
+                              static_cast<std::uint32_t>(kFrameRdx));
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x4C, 0x89, 0x84, 0x24},
+                              static_cast<std::uint32_t>(kFrameR8));
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x4C, 0x89, 0x8C, 0x24},
+                              static_cast<std::uint32_t>(kFrameR9));
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x4C, 0x89, 0x94, 0x24},
+                              static_cast<std::uint32_t>(kFrameR10));
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x4C, 0x89, 0x9C, 0x24},
+                              static_cast<std::uint32_t>(kFrameR11));
+
+    // rax = original caller rsp; retain it for the observer after RAX itself has been saved.
+    ok = ok && emit_bytes(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          std::array<std::uint8_t, 4>{0x48, 0x8D, 0x84, 0x24})
+         && emit_value(allocation,
+                       kThunkCodeLimit,
+                       cursor,
+                       static_cast<std::uint32_t>(kFrameAllocation));
+    ok = ok && emit_store_rsp(allocation,
+                              kThunkCodeLimit,
+                              cursor,
+                              {0x48, 0x89, 0x84, 0x24},
+                              static_cast<std::uint32_t>(kFrameOriginalRsp));
+
+    // XMM0-XMM5 are the volatile floating/vector argument registers in the Windows x64 ABI.
+    for (std::uint8_t index = 0; ok && index < 6; ++index) {
+        const std::uint8_t modrm = static_cast<std::uint8_t>(0x44U + index * 8U);
+        ok = emit_xmm(allocation,
+                      kThunkCodeLimit,
+                      cursor,
+                      false,
+                      modrm,
+                      static_cast<std::uint8_t>(kFrameXmm0 + index * 0x10U));
+    }
+
+    // RCX=site, RDX=frame, R8=original rsp, R9=return address.
+    ok = ok && emit8(allocation, kThunkCodeLimit, cursor, 0xB9)
+         && emit_value(allocation, kThunkCodeLimit, cursor, siteIndex);
+    ok = ok && emit_bytes(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          std::array<std::uint8_t, 4>{0x48, 0x8D, 0x14, 0x24});
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x4C, 0x8B, 0x84, 0x24},
+                             static_cast<std::uint32_t>(kFrameOriginalRsp));
+    ok = ok && emit_bytes(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          std::array<std::uint8_t, 3>{0x4D, 0x8B, 0x08});
+    ok = ok && emit_bytes(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          std::array<std::uint8_t, 2>{0x48, 0xB8})
+         && emit_value(allocation,
+                       kThunkCodeLimit,
+                       cursor,
+                       reinterpret_cast<std::uintptr_t>(&sunrise_script_probe_capture))
+         && emit_bytes(allocation,
+                       kThunkCodeLimit,
+                       cursor,
+                       std::array<std::uint8_t, 2>{0xFF, 0xD0});
+
+    // A Detours commit resumes threads just before C++ receives the trampoline pointer. A caller
+    // that arrives in that tiny window waits here with its saved machine state intact.
+    const std::size_t waitOffset = cursor;
+    ok = ok && emit_bytes(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          std::array<std::uint8_t, 8>{0x48, 0x83, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x00})
+         && emit_bytes(allocation,
+                       kThunkCodeLimit,
+                       cursor,
+                       std::array<std::uint8_t, 2>{0x74, 0xF6});
+
+    // Restore XMM argument registers before the original function sees them.
+    for (std::uint8_t index = 0; ok && index < 6; ++index) {
+        const std::uint8_t modrm = static_cast<std::uint8_t>(0x44U + index * 8U);
+        ok = emit_xmm(allocation,
+                      kThunkCodeLimit,
+                      cursor,
+                      true,
+                      modrm,
+                      static_cast<std::uint8_t>(kFrameXmm0 + index * 0x10U));
+    }
+
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x48, 0x8B, 0x8C, 0x24},
+                             static_cast<std::uint32_t>(kFrameRcx));
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x48, 0x8B, 0x94, 0x24},
+                             static_cast<std::uint32_t>(kFrameRdx));
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x4C, 0x8B, 0x84, 0x24},
+                             static_cast<std::uint32_t>(kFrameR8));
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x4C, 0x8B, 0x8C, 0x24},
+                             static_cast<std::uint32_t>(kFrameR9));
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x4C, 0x8B, 0x94, 0x24},
+                             static_cast<std::uint32_t>(kFrameR10));
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x4C, 0x8B, 0x9C, 0x24},
+                             static_cast<std::uint32_t>(kFrameR11));
+    // Restore the caller's entry flags after the readiness spin, then restore the original RAX.
+    ok = ok && emit_load_rsp(allocation,
+                             kThunkCodeLimit,
+                             cursor,
+                             {0x48, 0x8B, 0x84, 0x24},
+                             static_cast<std::uint32_t>(kFrameFlags))
+         && emit8(allocation, kThunkCodeLimit, cursor, 0x50)
+         && emit8(allocation, kThunkCodeLimit, cursor, 0x9D)
+         && emit_load_rsp(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          {0x48, 0x8B, 0x84, 0x24},
+                          static_cast<std::uint32_t>(kFrameRax));
+
+    // add rsp, 0xD8; jmp qword ptr [rip+disp32]; <trampoline pointer>
+    ok = ok && emit_bytes(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          std::array<std::uint8_t, 3>{0x48, 0x81, 0xC4})
+         && emit_value(allocation,
+                       kThunkCodeLimit,
+                       cursor,
+                       static_cast<std::uint32_t>(kFrameAllocation));
+    const std::size_t jumpOffset = cursor;
+    ok = ok && emit_bytes(allocation,
+                          kThunkCodeLimit,
+                          cursor,
+                          std::array<std::uint8_t, 6>{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+    const std::size_t trampolineOffset = cursor;
+    ok = ok && emit_value(allocation, kThunkCodeLimit, cursor, std::uintptr_t{});
+
+    if (ok) {
+        const auto waitDisplacement = static_cast<std::int32_t>(
+            trampolineOffset - (waitOffset + 8U));
+        const auto jumpDisplacement = static_cast<std::int32_t>(
+            trampolineOffset - (jumpOffset + 6U));
+        std::memcpy(allocation + waitOffset + 3U, &waitDisplacement, sizeof waitDisplacement);
+        std::memcpy(allocation + jumpOffset + 2U, &jumpDisplacement, sizeof jumpDisplacement);
+    }
+
+    if (!ok || cursor >= kUnwindInfoOffset) {
+        VirtualFree(allocation, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // One valid UNWIND_INFO entry describes only the fixed `sub rsp, 0xD8` prologue.
+    const std::array<std::uint8_t, 8> unwind{{0x01, 0x07, 0x02, 0x00, 0x07, 0x01, 0x1B, 0x00}};
+    std::memcpy(allocation + kUnwindInfoOffset, unwind.data(), unwind.size());
+    runtime.runtimeFunction.BeginAddress = 0;
+    runtime.runtimeFunction.EndAddress = static_cast<DWORD>(cursor);
+    runtime.runtimeFunction.UnwindData = kUnwindInfoOffset;
+    if (RtlAddFunctionTable(&runtime.runtimeFunction,
+                            1,
+                            reinterpret_cast<DWORD64>(allocation)) == FALSE) {
+        VirtualFree(allocation, 0, MEM_RELEASE);
+        runtime.runtimeFunction = {};
+        return false;
+    }
+
+    runtime.thunk = allocation;
+    runtime.trampolineSlot = reinterpret_cast<std::uintptr_t*>(allocation + trampolineOffset);
+    runtime.thunkCodeSize = cursor;
+    runtime.functionTableRegistered = true;
+    return true;
+}
+
+/** Releases a thunk only after its detour has been removed. */
+void release_thunk(SiteRuntime& runtime) noexcept {
+    if (runtime.functionTableRegistered) {
+        (void)RtlDeleteFunctionTable(&runtime.runtimeFunction);
+    }
+    if (runtime.thunk != nullptr) {
+        (void)VirtualFree(runtime.thunk, 0, MEM_RELEASE);
+    }
+    runtime.runtimeFunction = {};
+    runtime.thunk = nullptr;
+    runtime.trampolineSlot = nullptr;
+    runtime.thunkCodeSize = 0;
+    runtime.resolvedRva = 0;
+    runtime.functionTableRegistered = false;
+    runtime.hits.store(0, std::memory_order_relaxed);
+    runtime.sessionHits.store(0, std::memory_order_relaxed);
+    runtime.preSessionDetail.store(0, std::memory_order_relaxed);
+    runtime.sessionDetail.store(0, std::memory_order_relaxed);
+    runtime.loggedHits.store(0, std::memory_order_relaxed);
+    for (std::atomic_uint64_t& signature : runtime.preSessionSignatures) {
+        signature.store(0, std::memory_order_relaxed);
+    }
+    for (std::atomic_uint64_t& signature : runtime.sessionSignatures) {
+        signature.store(0, std::memory_order_relaxed);
+    }
+}
+
+/** Reports one target's entry bytes and attachment outcome. */
+void report_attach(std::size_t index, void* target, bool success) noexcept {
+    std::array<std::uint8_t, 12> head{};
+    SIZE_T copied{};
+    const bool read = target != nullptr
+                      && ReadProcessMemory(GetCurrentProcess(),
+                                           target,
+                                           head.data(),
+                                           head.size(),
+                                           &copied)
+                             != FALSE
+                      && copied == head.size();
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=script_native stage=attach site=%s source=%s target=+0x%08X result=%s "
+        "head=%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+        site_definition(index).name,
+        target_kind_name(site_definition(index).targetKind),
+        g_runtime[index].resolvedRva,
+        success ? "ok" : "fail",
+        read ? head[0] : 0,
+        read ? head[1] : 0,
+        read ? head[2] : 0,
+        read ? head[3] : 0,
+        read ? head[4] : 0,
+        read ? head[5] : 0,
+        read ? head[6] : 0,
+        read ? head[7] : 0,
+        read ? head[8] : 0,
+        read ? head[9] : 0,
+        read ? head[10] : 0,
+        read ? head[11] : 0);
+    if (written <= 0) {
+        return;
+    }
+    const auto length = static_cast<std::size_t>(written) < line.size()
+                            ? static_cast<std::size_t>(written)
+                            : line.size() - 1;
+    core::log::write(core::log::Channel::client,
+                     success ? core::log::Level::info : core::log::Level::warn,
+                     std::string_view(line.data(), length));
+}
+
+/** Reports total versus session-correlated traffic before counters are released on detach. */
+void report_summary(std::size_t index) noexcept {
+    const SiteRuntime& runtime = g_runtime[index];
+    std::array<char, core::log::kLineCapacity> line{};
+    const int written = std::snprintf(
+        line.data(),
+        line.size(),
+        "ev=script_native stage=summary site=%s total=%u session_hits=%u logged=%u",
+        site_definition(index).name,
+        runtime.hits.load(std::memory_order_relaxed),
+        runtime.sessionHits.load(std::memory_order_relaxed),
+        runtime.loggedHits.load(std::memory_order_relaxed));
+    if (written > 0) {
+        const auto length = static_cast<std::size_t>(written) < line.size()
+                                ? static_cast<std::size_t>(written)
+                                : line.size() - 1;
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::info,
+                         std::string_view(line.data(), length));
+    }
+}
+
+/** Detaches one site, retrying only when a thread is suspended inside its registered thunk range. */
+[[nodiscard]] bool detach_site(SiteRuntime& runtime) noexcept {
+    if (!runtime.hook.attached) {
+        release_thunk(runtime);
+        return true;
+    }
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        bool replacementActive{};
+        if (hooking::detour::uninstall(runtime.hook, replacementActive)) {
+            release_thunk(runtime);
+            return true;
+        }
+        if (!replacementActive) {
+            return false;
+        }
+        Sleep(1);
+    }
+    return false;
+}
+
+} // namespace
+
+bool install() noexcept {
+    if (g_installed.load(std::memory_order_acquire)) {
+        return true;
+    }
+    const HMODULE game = GetModuleHandleW(nullptr);
+    if (game == nullptr || !diagnostics::module_range(game, g_gameRange)) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::warn,
+                         "ev=script_native stage=install result=fail reason=game_range");
+        return false;
+    }
+
+    g_launchProperty.store(0, std::memory_order_relaxed);
+    g_launchPropertyOwner.store(0, std::memory_order_relaxed);
+    g_lastLaunchSampleMs.store(0, std::memory_order_relaxed);
+    g_lastLaunchSignature.store(0, std::memory_order_relaxed);
+
+    std::size_t attached = 0;
+    for (std::size_t index = 0; index < kRuntimeSiteCount; ++index) {
+        SiteRuntime& runtime = g_runtime[index];
+        release_thunk(runtime);
+        std::byte* const target = resolve_site_target(index, game);
+        if (target != nullptr && diagnostics::contains(g_gameRange, reinterpret_cast<std::uintptr_t>(target))) {
+            runtime.resolvedRva = static_cast<std::uint32_t>(
+                reinterpret_cast<std::uintptr_t>(target) - g_gameRange.base);
+        }
+        if (target == nullptr
+            || !diagnostics::contains(g_gameRange, reinterpret_cast<std::uintptr_t>(target))
+            || !executable_address(target) || !build_thunk(static_cast<std::uint32_t>(index), runtime)) {
+            report_attach(index, target, false);
+            release_thunk(runtime);
+            continue;
+        }
+
+        const hooking::detour::Spec spec{target, runtime.thunk};
+        if (!hooking::detour::install(spec, runtime.hook)) {
+            report_attach(index, target, false);
+            release_thunk(runtime);
+            continue;
+        }
+        // Detours owns the trampoline. The generated thunk only reads this pointer on its final
+        // tail jump and never calls an unknown native function directly. build_thunk always owns
+        // this embedded slot while the hook is attachable.
+        (void)InterlockedExchange64(reinterpret_cast<volatile LONG64*>(runtime.trampolineSlot),
+                                    static_cast<LONG64>(reinterpret_cast<std::uintptr_t>(
+                                        runtime.hook.original)));
+        FlushInstructionCache(GetCurrentProcess(), runtime.thunk, runtime.thunkCodeSize);
+        ++attached;
+        report_attach(index, target, true);
+    }
+
+    const bool installed = attached != 0;
+    g_installed.store(installed, std::memory_order_release);
+    std::array<char, 112> line{};
+    const int written = std::snprintf(line.data(),
+                                      line.size(),
+                                      "ev=script_native stage=install result=%s attached=%zu/%zu",
+                                      installed ? "ok" : "fail",
+                                      attached,
+                                      kRuntimeSiteCount);
+    if (written > 0) {
+        core::log::write(core::log::Channel::client,
+                         installed ? core::log::Level::info : core::log::Level::warn,
+                         std::string_view(line.data(), static_cast<std::size_t>(written)));
+    }
+    return installed;
+}
+
+bool uninstall() noexcept {
+    if (!g_installed.load(std::memory_order_acquire)) {
+        return true;
+    }
+    bool success = true;
+    for (std::size_t index = 0; index < kRuntimeSiteCount; ++index) {
+        report_summary(index);
+    }
+    for (std::size_t index = kRuntimeSiteCount; index-- > 0;) {
+        if (!detach_site(g_runtime[index])) {
+            success = false;
+        }
+    }
+    if (success) {
+        g_installed.store(false, std::memory_order_release);
+        g_launchProperty.store(0, std::memory_order_relaxed);
+        g_launchPropertyOwner.store(0, std::memory_order_relaxed);
+        g_lastLaunchSampleMs.store(0, std::memory_order_relaxed);
+        g_lastLaunchSignature.store(0, std::memory_order_relaxed);
+        g_gameRange = {};
+    }
+    core::log::write(core::log::Channel::client,
+                     success ? core::log::Level::info : core::log::Level::warn,
+                     success ? "ev=script_native stage=uninstall result=ok"
+                             : "ev=script_native stage=uninstall result=fail");
+    return success;
+}
+
+bool is_installed() noexcept {
+    return g_installed.load(std::memory_order_acquire);
+}
+
+} // namespace sunrise::client::hooks::script_probe

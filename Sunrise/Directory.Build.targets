@@ -25,6 +25,8 @@
     <ClCompile Include="src\state\activity\script_state\activity_script_state.cpp" />
     <ClCompile Include="src\server\script\activity_registry.cpp" />
     <ClCompile Include="src\server\script\lua_runtime.cpp" />
+    <ClCompile Include="src\client\hooks\script_probe\script_probe_lifecycle.cpp" />
+    <ClInclude Include="src\client\hooks\script_probe\script_probe_lifecycle.h" />
     <ClInclude Include="src\state\activity\script_state\definition.h" />
     <ClInclude Include="src\server\script\activity_registry.h" />
     <ClInclude Include="src\server\script\runtime.h" />

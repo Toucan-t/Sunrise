@@ -14,6 +14,7 @@
 #include "../hooks/polled_input/runtime.h"
 #include "../hooks/queuez/queuez_hook_lifecycle.h"
 #include "../hooks/retail_log/retail_log_lifecycle.h"
+#include "../hooks/script_probe/script_probe_lifecycle.h"
 #include "../hooks/spawn/spawn_runtime.h"
 #include "../hooks/teleport/runtime.h"
 #include "../movement/movement_settings_store.h"
@@ -40,6 +41,14 @@ bool initialize(void* module) noexcept {
 
 bool shutdown() noexcept {
     AcquireSRWLockExclusive(&runtime::g_lock);
+    // Dynamic probe thunks must detach before any other shutdown step can partially unwind Client.
+    if (!hooks::script_probe::uninstall()) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::error,
+                         "ev=shutdown stage=script_native result=fail");
+        ReleaseSRWLockExclusive(&runtime::g_lock);
+        return false;
+    }
     if (!hooks::graphics::uninstall()) {
         core::log::write(core::log::Channel::client,
                          core::log::Level::error,
