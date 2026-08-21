@@ -216,6 +216,11 @@
     <ClCompile Include="src\client\hooks\egress\winsock\transmission\egress_datagram_transmission.cpp" />
     <ClCompile Include="src\client\hooks\egress\winsock\transmission\egress_message_transmission.cpp" />
     <ClCompile Include="src\client\ui\runtime\client_ui_module_runtime.cpp" />
+    <ClCompile Include="src\client\editor\editor_state.cpp" />
+    <ClCompile Include="src\client\editor\catalog\editor_asset_catalog.cpp" />
+    <ClCompile Include="src\client\editor\textures\editor_texture_preview.cpp" />
+    <ClCompile Include="src\client\content\packages\package_keys.cpp" />
+    <ClCompile Include="src\client\ui\editor\editor_panel.cpp" />
     <ClCompile Include="src\client\ui\movement\movement_panel.cpp" />
     <ClCompile Include="src\client\movement\movement_settings_store.cpp" />
     <ClCompile Include="src\client\inactivity\inactivity_settings_store.cpp" />
@@ -606,6 +611,7 @@
     <ClCompile Include="src\middleware\content\packages\named_tags\named_tag_patch.cpp" />
     <ClCompile Include="src\middleware\content\packages\package_catalog.cpp" />
     <ClCompile Include="src\middleware\content\packages\reader\package_class_scan.cpp" />
+    <ClCompile Include="src\middleware\content\packages\reader\package_catalog_scan.cpp" />
     <ClCompile Include="src\middleware\content\packages\reader\package_parallel_read.cpp" />
     <ClCompile Include="src\middleware\content\packages\reader\package_entry_reader.cpp" />
     <ClCompile Include="src\middleware\content\packages\reader\package_header.cpp" />
@@ -926,6 +932,11 @@
     <ClInclude Include="src\client\hooks\graphics\renderer\state.h" />
     <ClInclude Include="src\client\hooks\graphics\renderer\graphics_renderer_report.h" />
     <ClInclude Include="src\client\ui\runtime\client_ui_module_runtime.h" />
+    <ClInclude Include="src\client\editor\editor_state.h" />
+    <ClInclude Include="src\client\editor\catalog\editor_asset_catalog.h" />
+    <ClInclude Include="src\client\editor\textures\editor_texture_preview.h" />
+    <ClInclude Include="src\client\content\packages\package_keys.h" />
+    <ClInclude Include="src\client\ui\editor\editor_panel.h" />
     <ClInclude Include="src\client\memory\current_process_memory.h" />
     <ClInclude Include="src\client\content\handles\layout.h" />
     <ClInclude Include="src\client\content\handles\handle_resolver.h" />

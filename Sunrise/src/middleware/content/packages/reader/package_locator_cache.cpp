@@ -110,4 +110,13 @@ void mark_complete(std::uint64_t directoryHash) noexcept {
     ReleaseSRWLockExclusive(&g_lock);
 }
 
+/** Clears cached package locations so a later pass observes newly published generations. */
+void clear() noexcept {
+    AcquireSRWLockExclusive(&g_lock);
+    g_entries = {};
+    g_cursor = 0;
+    g_completeDirectory = 0;
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
 } // namespace sunrise::middleware::content::packages::reader::locator_cache

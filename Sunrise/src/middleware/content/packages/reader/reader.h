@@ -133,12 +133,92 @@ struct ClassEntry {
 /** Visitor for when the package family is part of the extracted domain key. */
 using ClassEntryVisitor = bool (*)(void* context, const ClassEntry& entry) noexcept;
 
+/** One installed entry reported by a whole-package catalog scan. */
+struct CatalogEntry {
+    std::uint32_t tag{};
+    /** Raw EntryRecord::reference. Its meaning depends on the decoded entry family. */
+    std::uint32_t reference{};
+    /** Raw EntryRecord::typeInfo, retained for generic inspection. */
+    std::uint32_t typeInfo{};
+    /** Package file type decoded as (typeInfo >> 9) & 0x7F. */
+    std::uint8_t fileType{};
+    /** Package file subtype decoded as (typeInfo >> 6) & 0x07. */
+    std::uint8_t fileSubtype{};
+    /** Every typeInfo bit outside the file-type and subtype fields. */
+    std::uint32_t selectorBits{};
+    /** Size declared by the entry's decoded placement. No payload read is required. */
+    std::uint32_t decodedSize{};
+    std::uint32_t entryIndex{};
+    /** Entry count declared by the owning highest-generation package. */
+    std::uint32_t packageEntryCount{};
+    std::uint16_t packageId{};
+    /** Highest installed patch suffix selected for the package family. */
+    std::uint32_t patchIndex{};
+    /** Leaf name without the patch suffix or extension. Valid only during the visitor call. */
+    std::wstring_view packageFamily;
+};
+
+/** Visitor called once for every entry of every highest-generation installed package. */
+using CatalogEntryVisitor = bool (*)(void* context, const CatalogEntry& entry) noexcept;
+
+/** Failure stage from one whole installed-package catalog scan. */
+enum class CatalogScanFailure : std::uint8_t {
+    none,
+    invalidArguments,
+    searchPattern,
+    enumerateDirectory,
+    locateLatest,
+    packageFamily,
+    buildPath,
+    readHeader,
+    parseHeader,
+    entryCountOutOfRange,
+    readEntryTable,
+    visitorRejected,
+    enumerateDirectoryAdvance,
+    closeEnumeration,
+};
+
+/** Totals and failure location from one whole installed-package catalog scan. */
+struct CatalogScanResult {
+    std::size_t packages{};
+    std::size_t entries{};
+    CatalogScanFailure failure{CatalogScanFailure::none};
+    std::uint16_t packageId{};
+    std::uint32_t patchIndex{};
+    std::uint32_t entryIndex{};
+};
+
 /**
- * Reports every installed entry of one tag class.
+ * Reports every installed entry without decoding payload blocks.
+ * Only the highest patch of each package id is scanned. The pass reads public headers and entry
+ * tables only, which keeps editor indexing independent of block keys and Oodle.
+ * @param directory Installed packages directory.
+ * @param visitor Required non-owning entry consumer.
+ * @param context Caller context passed to the visitor.
+ * @param result Receives package and entry totals.
+ * @return True when the directory walk, every package table and every visitor call work.
+ */
+[[nodiscard]] bool scan_entries(std::wstring_view directory,
+                                CatalogEntryVisitor visitor,
+                                void* context,
+                                CatalogScanResult& result) noexcept;
+
+/**
+ * Drops cached package-stem/latest-generation discovery.
+ * Call this before an explicit rescan that must observe package files created since the previous
+ * lookup, such as an editor refresh or future hot-reload publication.
+ */
+void invalidate_locations() noexcept;
+
+/**
+ * Compatibility scan that compares EntryRecord::reference with one caller-supplied value.
+ * This is appropriate only when the caller already knows that reference is a schema/class handle
+ * for the entry family being scanned. It is not a general package file-type classifier.
  * Only the highest patch of each package is scanned, so a tag is reported once.
  * Entry tables are plain file data, so this needs no block keys and runs before any are known.
  * @param directory Installed packages directory.
- * @param classId Tag class to report.
+ * @param classId Raw reference value to match.
  * @param visitor Required non-owning tag consumer.
  * @param context Caller context passed to the visitor.
  * @param result Receives package, entry and match totals.
@@ -151,10 +231,11 @@ using ClassEntryVisitor = bool (*)(void* context, const ClassEntry& entry) noexc
                               ScanResult& result) noexcept;
 
 /**
- * Reports every installed entry of one tag class with its package family.
+ * Compatibility reference scan with the owning package family included.
+ * The caller must know that EntryRecord::reference is a schema/class handle for the family.
  * Only the highest patch of each package is scanned, so a tag is reported once.
  * @param directory Installed packages directory.
- * @param classId Tag class to report.
+ * @param classId Raw reference value to match.
  * @param visitor Required non-owning entry consumer.
  * @param context Caller context passed to the visitor.
  * @param result Receives package, entry, and match totals.

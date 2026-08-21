@@ -4,9 +4,7 @@
 
 #include "../../../../core/filesystem/path.h"
 #include "../../../../state/content/content_catalog.h"
-#include "../../../../state/runtime/runtime.h"
-#include "../../../memory/current_process_memory.h"
-#include "../../../targets/game.h"
+#include "../../packages/package_keys.h"
 #include "build.h"
 #include "internal.h"
 
@@ -30,28 +28,7 @@ bool readable() noexcept {
 
 /** Copies the block key material this pass borrows. */
 bool collect_keys(reader::BlockKeys& keys) noexcept {
-    keys = {};
-    const state::SignOnState& signOn = state::sign_on();
-    targets::game::packages::KeyTable table{};
-    if (!signOn.bootstrapTokenPresent) {
-        return false;
-    }
-    const bool read = targets::game::packages::read(table);
-    if (!read) {
-        SecureZeroMemory(&table, sizeof table);
-        return false;
-    }
-    keys.alternate = table.alternateKey;
-    keys.nonceBase = table.nonceBase;
-    // The primary key comes straight from the bootstrap token and the installed identity
-    // constant, byte by byte, without reading a native derived-identity buffer.
-    for (std::size_t index = 0; index < keys.primary.size(); ++index) {
-        const auto tokenByte = static_cast<unsigned char>(signOn.bootstrapToken[index]);
-        const auto constantByte = static_cast<unsigned char>(table.identityConstant[index]);
-        keys.primary[index] = static_cast<std::byte>(tokenByte + constantByte);
-    }
-    SecureZeroMemory(&table, sizeof table);
-    return true;
+    return sunrise::client::content::packages::collect_block_keys(keys);
 }
 
 /** Collects every catalogue tag carrying the container name. */

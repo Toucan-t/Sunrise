@@ -47,4 +47,10 @@ void store(std::uint64_t directoryHash,
 /** @param directoryHash Key of the directory whose package files are now all recorded. */
 void mark_complete(std::uint64_t directoryHash) noexcept;
 
+/**
+ * Drops every remembered package stem and completed-directory marker.
+ * Editor refresh and future hot reload call this before re-enumerating package generations.
+ */
+void clear() noexcept;
+
 } // namespace sunrise::middleware::content::packages::reader::locator_cache

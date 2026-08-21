@@ -174,4 +174,9 @@ bool read_at(Scratch& scratch,
     return handle_cache::read(scratch, path, offset, output);
 }
 
+/** Drops cached package locations so the next lookup observes newly published generations. */
+void invalidate_locations() noexcept {
+    locator_cache::clear();
+}
+
 } // namespace sunrise::middleware::content::packages::reader
