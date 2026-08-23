@@ -184,6 +184,12 @@ struct PeerLink {
     std::uint32_t remoteConnectionSequence{};
     std::uint32_t remoteTransportSequence{};
     /**
+     * True once this exact channel incarnation has accepted the host's reliable establish.
+     * Connect requests are retransmitted out of band; without this latch each retry appends a
+     * duplicate establish and can exhaust the reliable queue before a regional join publishes.
+     */
+    bool localEstablishQueued{};
+    /**
      * Group sessions joined over this link, zero in the free slots. The client holds one channel
      * per host peer and multiplexes every region's session over it, so a link carries a set.
      */

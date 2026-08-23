@@ -188,21 +188,32 @@ void answer_establish(const gp::Endpoint& to,
     AcquireSRWLockExclusive(&g_lock);
     // The endpoint's link. A channel the peer has retired has no link of its own to answer on.
     gp::PeerLink* peer = find_locked(to);
-    const bool queued =
-        peer != nullptr && peer->remoteConnectionSequence == remoteChannelId
-        && wire::enqueue_message(peer->outbound,
-                                 static_cast<std::uint8_t>(wire::ConnectId::establish),
-                                 wire::kEstablishSize,
-                                 {buffer.data(), size},
-                                 writer.bit_count());
-    if (queued) {
-        peer->acknowledgementOwed = true;
-        peer->outbound.awaitingAcknowledgement = false;
+    bool queued = false;
+    bool held = false;
+    if (peer != nullptr && peer->remoteConnectionSequence == remoteChannelId) {
+        // The out-of-band connect request is retransmittable, but the reliable establish is one
+        // transaction per channel incarnation. The reliable queue already retransmits it until
+        // acknowledged, so appending another copy can only consume queue capacity needed by the
+        // regional membership and parameter publications that follow.
+        held = peer->localEstablishQueued;
+        if (!held) {
+            queued = wire::enqueue_message(peer->outbound,
+                                           static_cast<std::uint8_t>(wire::ConnectId::establish),
+                                           wire::kEstablishSize,
+                                           {buffer.data(), size},
+                                           writer.bit_count());
+            if (queued) {
+                peer->localEstablishQueued = true;
+                peer->acknowledgementOwed = true;
+                peer->outbound.awaitingAcknowledgement = false;
+            }
+        }
     }
     ReleaseSRWLockExclusive(&g_lock);
-    report(core::log::Level::info,
+    const char* const result = held ? "held" : queued ? "queued" : "fail";
+    report(held ? core::log::Level::debug : core::log::Level::info,
            "ev=gameplay stage=establish result=%s local=0x%08X remote=0x%08X",
-           queued ? "queued" : "fail",
+           result,
            body.channelId,
            body.remoteChannelId);
 }

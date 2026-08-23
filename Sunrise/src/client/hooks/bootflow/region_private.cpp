@@ -10,6 +10,7 @@
 #include "../../../core/settings/settings.h"
 #include "../../../state/activity/forced/activity_forced_destination.h"
 #include "../../hooking/detour.h"
+#include "../retail_log/retail_log_enqueue_observer.h"
 #include "internal.h"
 
 namespace sunrise::client::hooks::bootflow {
@@ -122,14 +123,43 @@ __declspec(noinline) bool __fastcall reader(std::uint32_t sliceSet) noexcept {
     if (original == nullptr) {
         return false;
     }
-    if (!original(sliceSet)) {
-        return false;
-    }
+
+    const bool nativePublic = original(sliceSet);
     const auto* const caller = static_cast<const std::byte*>(_ReturnAddress());
     if (caller != g_returnSite.load(std::memory_order_acquire)) {
+        return nativePublic;
+    }
+
+    // Warden must take the citizen/public topology at this exact classification boundary.  This
+    // intentionally runs before both the native-private return and forced-destination solo policy:
+    // those are the two paths that otherwise create PRIVATE CURRENT and leave no gameplay peer
+    // session/entity-manager binding. Other destinations retain the native Sunrise behavior.
+    if (retail_log::warden_authored_path_active()) {
+        if (g_forced.fetch_add(1, std::memory_order_relaxed) < kMaxReports) {
+            std::array<char, kLineCapacity> line{};
+            const int written = std::snprintf(
+                line.data(),
+                line.size(),
+                "ev=bootflow stage=region result=warden_public slice_set=%u native=%u",
+                static_cast<unsigned>(sliceSet),
+                nativePublic ? 1U : 0U);
+            if (written > 0) {
+                const auto length = static_cast<std::size_t>(written) < line.size()
+                                        ? static_cast<std::size_t>(written)
+                                        : line.size() - 1;
+                core::log::write(core::log::Channel::client,
+                                 core::log::Level::info,
+                                 {line.data(), length});
+            }
+        }
         return true;
     }
-    // No public host serves a forced destination, so that run waits forever. It must load solo.
+
+    if (!nativePublic) {
+        return false;
+    }
+
+    // Non-Warden forced destinations still load solo because no public host serves them.
     const bool forced =
         core::settings::get().client.regionPrivate || state::activity::forced::override_active();
     report(sliceSet, forced);

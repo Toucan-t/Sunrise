@@ -71,8 +71,11 @@ bool encode_response(state::matchmaking::ContextHandle context,
     }
 
     state::matchmaking::LatestSnapshot latest{};
-    if (response.kind == service::RequestKind::locateSession
+    if ((response.kind == service::RequestKind::sessionSearch
+         || response.kind == service::RequestKind::locateSession)
         && state::matchmaking::latest_snapshot(context, latest)) {
+        // Search and locate must describe the same retained local host. Kind 1 deliberately omits
+        // the advertisement id on the wire, while kind 7 includes it in its own response shape.
         response.advertisementId = latest.advertisementId;
         if (latest.hasDescriptor) {
             response.descriptor = std::span(latest.descriptor);

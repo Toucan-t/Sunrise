@@ -42,6 +42,7 @@ bool uninstall() noexcept {
     AcquireSRWLockExclusive(&g_lock);
     if (!g_handle.attached) {
         ReleaseSRWLockExclusive(&g_lock);
+        restore_warden_private_fast_path();
         return true;
     }
     // The observer body reads the trampoline without a lock, so it must be idle at detach.
@@ -50,6 +51,9 @@ bool uninstall() noexcept {
     const bool removed = hooking::detour::uninstall(g_handle, protectedEntries)
                          == hooking::detour::UninstallResult::removed;
     ReleaseSRWLockExclusive(&g_lock);
+    if (removed) {
+        restore_warden_private_fast_path();
+    }
     return removed;
 }
 

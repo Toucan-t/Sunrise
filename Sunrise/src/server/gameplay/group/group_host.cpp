@@ -1,19 +1,24 @@
-﻿#include "group_host.h"
+#include "group_host.h"
 
 #include <Windows.h>
 
 #include <array>
 #include <atomic>
+#include <cstddef>
+#include <span>
 
+#include "../../../client/hooks/retail_log/retail_log_enqueue_observer.h"
 #include "../../../core/settings/settings.h"
 #include "../../../middleware/gameplay/descriptor/join_descriptor.h"
 #include "../../../middleware/gameplay/group/member_messages.h"
+#include "../../../middleware/gameplay/group/migration_messages.h"
 #include "../../../middleware/gameplay/group/parameter_messages.h"
 #include "../../../middleware/gameplay/group/parameter_registry.h"
 #include "../../../middleware/gameplay/group/session_messages.h"
 #include "../../../middleware/gameplay/group/session_state.h"
 #include "../../../middleware/gameplay/group/view_message.h"
 #include "../../../state/activity/runtime.h"
+#include "../dtls/dtls_host.h"
 #include "../endpoint/gameplay_endpoint.h"
 #include "../gameplay_log.h"
 #include "../peer/peer_transport.h"
@@ -29,7 +34,7 @@ namespace bits = middleware::encoding::bits;
 namespace descriptor = middleware::gameplay::descriptor;
 
 /** One reliable body staged before it is split into fragments. */
-constexpr std::size_t kBodyCapacity = 128;
+constexpr std::size_t kBodyCapacity = 160;
 /** A membership snapshot is far larger, and the peer's reliable send queue bounds it. */
 constexpr std::size_t kMembershipBodyCapacity = 512;
 /** Only the low 25 bitmap bits name a registry parameter. */
@@ -56,6 +61,35 @@ constexpr std::uint64_t kRetryInterval = 250;
 constexpr std::uint32_t kPeerPlayerSlot = 0;
 /** Counter the first player of a session carries. The consumer's own add starts here too. */
 constexpr std::uint32_t kFirstAddSequence = 0;
+/** Same odd stride used by the citizen advertisement for one region-specific identity. */
+constexpr std::uint64_t kRegionIdentityStride = 0x9E3779B97F4A7C15ULL;
+/** Recovered host-transition count used for the completed handoff edge. */
+constexpr std::uint8_t kHostTransitionComplete = wire::kMaximumHandoffProgress;
+/** The transition dword remains opaque. Zero is the controlled baseline for this experiment. */
+constexpr std::uint32_t kHostTransitionOpaque = 0;
+
+/** Ordered migration stages. Each reliable edge is allowed to dispatch before the next is queued. */
+enum class HostMigrationPhase : std::uint8_t {
+    idle,
+    settling,
+    awaitingBaselineReestablish,
+    handoffToPeerReady,
+    awaitingPeerHandoff,
+    transitionReady,
+    awaitingNativeHostReestablish,
+    peerReestablishReady,
+    complete,
+};
+
+/** Exact security/session identity accepted from the native kind-22 migration edge. */
+struct NativeHostAckReceipt {
+    std::uint64_t sessionId{};
+    std::uint64_t machineId{};
+    std::array<std::byte, wire::kHostReestablishOpaque16Bytes> opaque16{};
+    std::array<std::byte, wire::kHostReestablishOpaque18Bytes> opaque18{};
+    bool valid{};
+    bool nativeSecurityRegistered{};
+};
 
 /** One admitted peer and the player it asked this host to add. */
 struct Admitted {
@@ -66,6 +100,10 @@ struct Admitted {
     std::uint64_t sessionId{};
     bool occupied{};
     bool hasPlayer{};
+    /** Set once the first ready-state membership snapshot has entered the reliable queue. */
+    bool initialMembershipPublished{};
+    /** Set once the join-latch parameter update has entered the reliable queue. */
+    bool initialParametersPublished{};
     /** Set once the peer reports its join finished, which is what promotes it to `established`. */
     bool joinComplete{};
     /** Set once a snapshot carrying that promotion is on the peer's reliable channel. */
@@ -74,6 +112,12 @@ struct Admitted {
     bool activityHostPublished{};
     /** Set once a snapshot naming the peer's player is on that channel. The queue can refuse it. */
     bool playerPublished{};
+    /** Current native host-migration publication edge for this group session. */
+    HostMigrationPhase migrationPhase{HostMigrationPhase::idle};
+    /** Native kind-22 identity whose security registration authorized the final kind-25 ACK. */
+    NativeHostAckReceipt nativeHostAckReceipt{};
+    /** Earliest service tick at which the next unacknowledged migration edge may be queued. */
+    std::uint64_t migrationDue{};
     /** Tick of the last retry, so a full queue is retried on a timer rather than every packet. */
     std::uint64_t lastRetry{};
     /** Order in which the peer last named this session. The lowest is the least recently used. */
@@ -128,6 +172,310 @@ template <typename Body>
     }
     return peer::enqueue_reliable(
         sessionId, id, declaredSize, {body.data(), size}, writer.bit_count());
+}
+
+/** @return A stable nonzero region-specific copy of one endpoint identity. */
+[[nodiscard]] std::uint64_t region_identity(std::uint64_t base, std::int32_t regionIndex) noexcept {
+    const auto region = static_cast<std::uint64_t>(static_cast<std::uint32_t>(regionIndex));
+    const std::uint64_t derived = base ^ (kRegionIdentityStride * (region + 1U));
+    return derived == 0 ? kRegionIdentityStride : derived;
+}
+
+/** Formats one byte array as uppercase hexadecimal without separators. */
+template <std::size_t Size>
+void format_hex(const std::array<std::byte, Size>& input,
+                std::array<char, (Size * 2) + 1>& output) noexcept {
+    static constexpr char kDigits[] = "0123456789ABCDEF";
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        const auto value = std::to_integer<unsigned>(input[index]);
+        output[index * 2] = kDigits[(value >> 4U) & 0xFU];
+        output[(index * 2) + 1] = kDigits[value & 0xFU];
+    }
+    output[Size * 2] = '\0';
+}
+
+/** Reads up to eight bytes low-byte-first, mirroring the raw-u64 migration reader. */
+template <std::size_t Size>
+[[nodiscard]] std::uint64_t read_low_u64(const std::array<std::byte, Size>& input,
+                                         std::size_t offset = 0) noexcept {
+    std::uint64_t value = 0;
+    const std::size_t available = offset < Size ? Size - offset : 0;
+    const std::size_t count = available < sizeof(value) ? available : sizeof(value);
+    for (std::size_t index = 0; index < count; ++index) {
+        value |= std::to_integer<std::uint64_t>(input[offset + index]) << (index * 8U);
+    }
+    return value;
+}
+
+/** Recreates the eight raw bytes a little-endian raw-u64 reader consumed. */
+[[nodiscard]] std::array<std::byte, sizeof(std::uint64_t)> raw_u64_bytes(
+    std::uint64_t value) noexcept {
+    std::array<std::byte, sizeof(std::uint64_t)> output{};
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        output[index] = static_cast<std::byte>((value >> (index * 8U)) & 0xFFU);
+    }
+    return output;
+}
+
+/** Human-readable phase labels used only by migration diagnostics. */
+[[nodiscard]] const char* migration_phase_name(HostMigrationPhase phase) noexcept {
+    switch (phase) {
+    case HostMigrationPhase::idle:
+        return "idle";
+    case HostMigrationPhase::settling:
+        return "settling";
+    case HostMigrationPhase::awaitingBaselineReestablish:
+        return "await_baseline_reestablish";
+    case HostMigrationPhase::handoffToPeerReady:
+        return "handoff_to_peer_ready";
+    case HostMigrationPhase::awaitingPeerHandoff:
+        return "await_peer_handoff";
+    case HostMigrationPhase::transitionReady:
+        return "transition_ready";
+    case HostMigrationPhase::awaitingNativeHostReestablish:
+        return "await_native_host_reestablish";
+    case HostMigrationPhase::peerReestablishReady:
+        return "peer_reestablish_ready";
+    case HostMigrationPhase::complete:
+        return "complete";
+    default:
+        return "unknown";
+    }
+}
+
+/**
+ * Tests whether a native kind-22 is the exact security identity already accepted for this
+ * completed migration. The NetAddr is deliberately excluded: the intentional native resecure can
+ * rebuild the channel surface while preserving the accepted session/security identity.
+ */
+[[nodiscard]] bool same_accepted_native_host(const NativeHostAckReceipt& accepted,
+                                             const wire::HostReestablish& receipt) noexcept {
+    return accepted.valid && accepted.nativeSecurityRegistered
+           && accepted.sessionId == receipt.sessionId && accepted.machineId == receipt.machineId
+           && accepted.opaque16 == receipt.opaque16 && accepted.opaque18 == receipt.opaque18;
+}
+
+/**
+ * Rebuilds the exact 128-byte descriptor image the matching citizen advertisement used.
+ * The reestablish writer prefixes only the group session id, preserving the descriptor's 86-byte
+ * NetAddr and both opaque identity regions byte-for-byte.
+ */
+[[nodiscard]] bool build_host_descriptor(
+    const Admitted& record,
+    std::array<std::byte, descriptor::kDescriptorSize>& output,
+    std::uint64_t& onlineSessionId,
+    std::int32_t& regionIndex) noexcept {
+    HostSessionBinding binding{};
+    if (!host_session_for_group(record.sessionId, binding) || binding.regionIndex < 0) {
+        return false;
+    }
+    const endpoint::Identity identity = endpoint::identity();
+    const state::gameplay::Endpoint advertised = endpoint::advertised();
+    onlineSessionId = region_identity(identity.onlineSessionId, binding.regionIndex);
+    regionIndex = binding.regionIndex;
+
+    descriptor::JoinEndpoint join{};
+    join.machineId = record.sessionId;
+    join.address = advertised.address;
+    join.port = advertised.port;
+    join.onlineSessionId = onlineSessionId;
+    return descriptor::build(join, output);
+}
+
+/** Queues one 136-byte host-reestablish body using the proven citizen descriptor image. */
+[[nodiscard]] bool publish_host_reestablish(const Admitted& record, const char* phase) noexcept {
+    std::array<std::byte, descriptor::kDescriptorSize> descriptorBytes{};
+    std::uint64_t onlineSessionId = 0;
+    std::int32_t regionIndex = -1;
+    if (!build_host_descriptor(record, descriptorBytes, onlineSessionId, regionIndex)) {
+        report(core::log::Level::debug,
+               "ev=gameplay stage=host_reestablish phase=%s result=deferred session=0x%016llX",
+               phase,
+               static_cast<unsigned long long>(record.sessionId));
+        return false;
+    }
+    const bool sent = send_reliable(
+        record.sessionId,
+        static_cast<std::uint8_t>(wire::MigrationMessageId::hostReestablish),
+        wire::kHostReestablishSize,
+        [&record, &descriptorBytes](bits::Writer& writer) noexcept {
+            return wire::write_host_reestablish(writer, record.sessionId, descriptorBytes);
+        });
+    report(sent ? core::log::Level::info : core::log::Level::debug,
+           "ev=gameplay stage=host_reestablish phase=%s result=%s session=0x%016llX "
+           "machine=0x%016llX region=%d online=0x%016llX bytes=%u",
+           phase,
+           sent ? "queued" : "deferred",
+           static_cast<unsigned long long>(record.sessionId),
+           static_cast<unsigned long long>(record.sessionId),
+           static_cast<int>(regionIndex),
+           static_cast<unsigned long long>(onlineSessionId),
+           wire::kHostReestablishSize);
+    return sent;
+}
+
+/** Queues one host-handoff using the exact member NetAddr already published in membership. */
+[[nodiscard]] bool publish_host_handoff(const Admitted& record,
+                                        std::uint8_t successorIndex,
+                                        const char* phase) noexcept {
+    wire::HostHandoff body{};
+    body.sessionId = record.sessionId;
+    body.successorIndex = successorIndex;
+    if (successorIndex == kPeerMemberIndex) {
+        // A rebuilt endpoint can be logically equal but byte-different. Handoff requires the exact
+        // transport-captured peer address used for self-member resolution.
+        if (!peer::remote_address(record.sessionId, body.successorAddress)) {
+            report(core::log::Level::debug,
+                   "ev=gameplay stage=host_handoff phase=%s result=deferred reason=no_peer_addr "
+                   "session=0x%016llX successor=%u",
+                   phase,
+                   static_cast<unsigned long long>(record.sessionId),
+                   static_cast<unsigned>(successorIndex));
+            return false;
+        }
+    } else if (successorIndex == kHostMemberIndex) {
+        const state::gameplay::Endpoint host = endpoint::advertised();
+        descriptor::write_net_addr(host.address, host.port, body.successorAddress);
+    } else {
+        return false;
+    }
+
+    const bool sent = send_reliable(
+        record.sessionId,
+        static_cast<std::uint8_t>(wire::MigrationMessageId::hostHandoff),
+        wire::kHostHandoffSize,
+        [&body](bits::Writer& writer) noexcept { return wire::write_host_handoff(writer, body); });
+    report(sent ? core::log::Level::info : core::log::Level::debug,
+           "ev=gameplay stage=host_handoff phase=%s result=%s session=0x%016llX successor=%u "
+           "bytes=%u",
+           phase,
+           sent ? "queued" : "deferred",
+           static_cast<unsigned long long>(record.sessionId),
+           static_cast<unsigned>(successorIndex),
+           wire::kHostHandoffSize);
+    return sent;
+}
+
+/** Queues the recovered host-transition grammar with one controlled opaque dword. */
+[[nodiscard]] bool publish_host_transition(const Admitted& record) noexcept {
+    wire::HostTransition body{};
+    body.sessionId = record.sessionId;
+    body.progress = kHostTransitionComplete;
+    body.transitionToken = kHostTransitionOpaque;
+    const bool sent = send_reliable(
+        record.sessionId,
+        static_cast<std::uint8_t>(wire::MigrationMessageId::hostTransition),
+        wire::kHostTransitionSize,
+        [&body](bits::Writer& writer) noexcept {
+            return wire::write_host_transition(writer, body);
+        });
+    report(sent ? core::log::Level::info : core::log::Level::debug,
+           "ev=gameplay stage=host_transition result=%s session=0x%016llX count=%u "
+           "opaque=0x%08X bytes=%u",
+           sent ? "queued" : "deferred",
+           static_cast<unsigned long long>(record.sessionId),
+           static_cast<unsigned>(body.progress),
+           body.transitionToken,
+           wire::kHostTransitionSize);
+    return sent;
+}
+
+/**
+ * Acknowledges the native host-reestablish emitted after the local peer accepts our transition.
+ * Kind 25 is session-only; queuing it completes Sunrise's side of this migration handshake.
+ */
+[[nodiscard]] bool publish_peer_reestablish(const Admitted& record, const char* phase) noexcept {
+    const bool sent = send_reliable(
+        record.sessionId,
+        static_cast<std::uint8_t>(wire::MigrationMessageId::peerReestablish),
+        wire::kPeerReestablishSize,
+        [&record](bits::Writer& writer) noexcept {
+            return wire::write_migration_session(writer, record.sessionId);
+        });
+    report(sent ? core::log::Level::info : core::log::Level::debug,
+           "ev=gameplay stage=peer_reestablish phase=%s result=%s "
+           "session=0x%016llX bytes=%u",
+           phase,
+           sent ? "queued" : "deferred",
+           static_cast<unsigned long long>(record.sessionId),
+           wire::kPeerReestablishSize);
+    return sent;
+}
+
+/**
+ * Advances only server-originated migration edges. Receipt-driven edges are changed by consume().
+ * The first pulse waits until membership, activityHost, and the local player row are all published.
+ */
+void service_migration(Admitted& record, std::uint64_t now) noexcept {
+    const bool publicationReady = record.joinComplete && record.joinPublished
+                                  && record.activityHostPublished && record.hasPlayer
+                                  && record.playerPublished;
+    if (record.migrationPhase == HostMigrationPhase::idle) {
+        if (!publicationReady) {
+            return;
+        }
+        // A newly armed migration owns a new acknowledgement identity. Keep the completed
+        // receipt alive through resecure, but never carry it into a later migration transaction.
+        record.nativeHostAckReceipt = {};
+        record.migrationPhase = HostMigrationPhase::settling;
+        record.migrationDue = now + kRetryInterval;
+        report(core::log::Level::info,
+               "ev=gameplay stage=migration result=armed session=0x%016llX delay=%llu",
+               static_cast<unsigned long long>(record.sessionId),
+               static_cast<unsigned long long>(kRetryInterval));
+        return;
+    }
+    if (record.migrationPhase == HostMigrationPhase::complete || now < record.migrationDue) {
+        return;
+    }
+
+    bool queued = false;
+    switch (record.migrationPhase) {
+    case HostMigrationPhase::settling:
+        queued = publish_host_reestablish(record, "baseline");
+        if (queued) {
+            record.migrationPhase = HostMigrationPhase::awaitingBaselineReestablish;
+        }
+        break;
+    case HostMigrationPhase::handoffToPeerReady:
+        queued = publish_host_handoff(
+            record, static_cast<std::uint8_t>(kPeerMemberIndex), "to_peer");
+        if (queued) {
+            record.migrationPhase = HostMigrationPhase::awaitingPeerHandoff;
+        }
+        break;
+    case HostMigrationPhase::transitionReady:
+        queued = publish_host_transition(record);
+        if (queued) {
+            // The client becomes the native host after accepting the transition and emits kind 22
+            // back to member zero. Do not hand authority back to Sunrise; wait for that native
+            // reestablish and answer it with peer-reestablish kind 25.
+            record.migrationPhase = HostMigrationPhase::awaitingNativeHostReestablish;
+            record.migrationDue = 0;
+            return;
+        }
+        break;
+    case HostMigrationPhase::peerReestablishReady:
+        queued = publish_peer_reestablish(record, "ack_native_host");
+        if (queued) {
+            // Commit replay eligibility at the same boundary as the first successful kind-25.
+            record.nativeHostAckReceipt.valid =
+                record.nativeHostAckReceipt.nativeSecurityRegistered;
+            record.migrationPhase = HostMigrationPhase::complete;
+            record.migrationDue = 0;
+            report(core::log::Level::info,
+                   "ev=gameplay stage=migration result=complete session=0x%016llX "
+                   "edge=native_host_reestablish_ack",
+                   static_cast<unsigned long long>(record.sessionId));
+            return;
+        }
+        break;
+    default:
+        return;
+    }
+    if (!queued) {
+        record.migrationDue = now + kRetryInterval;
+    }
 }
 
 /** @return True when two endpoints name the same address and port. */
@@ -299,6 +647,43 @@ template <typename Body>
         wire::kMembershipUpdateSize,
         {body.data(), size},
         writer.bit_count());
+}
+
+/**
+ * Publishes the parameter update that releases the joining peer's initial application latch.
+ * The caller holds the admitted lock. A queued update is sticky for this join transaction: client
+ * retries must not append duplicate copies and crowd later membership/activity-host publications.
+ * @param record Admitted join transaction.
+ * @return True once this transaction has queued the update.
+ */
+[[nodiscard]] bool publish_initial_parameters(Admitted& record) noexcept {
+    if (record.initialParametersPublished) {
+        return true;
+    }
+    // Keep the retail ordering observed by the client: membership first, then at least one named
+    // group parameter. If the membership queue was full, service() retries it before this update.
+    if (!record.initialMembershipPublished) {
+        return false;
+    }
+    wire::ParameterUpdate update{};
+    update.sessionId = record.sessionId;
+    update.releasedMask = std::uint64_t{1} << kJoinLatchParameter;
+
+    const bool sent = send_reliable(
+        record.sessionId,
+        wire::kParameterUpdateId,
+        wire::kParameterUpdateSize,
+        [&update](bits::Writer& writer) { return wire::write_parameter_update(writer, update); });
+    if (sent) {
+        record.initialParametersPublished = true;
+    }
+    std::array<char, kParameterNameCapacity> names{};
+    report(sent ? core::log::Level::info : core::log::Level::warn,
+           "ev=gameplay stage=parameters result=%s released=0x%08X names=%s",
+           sent ? "queued" : "fail",
+           static_cast<unsigned>(update.releasedMask),
+           wire::parameter_names(update.releasedMask, names.data(), names.size()));
+    return sent;
 }
 
 /**
@@ -733,8 +1118,231 @@ bool consume(const state::gameplay::Endpoint& from,
                static_cast<unsigned>(request.kind));
         return false;
     }
-    // Migration and election bodies are read and recorded. This host never starts a migration and
-    // never answers one, but leaving them unread would end the container at the first of them.
+    if (id == static_cast<std::uint8_t>(wire::MigrationMessageId::hostReestablish)) {
+        wire::HostReestablish receipt{};
+        if (!wire::read_host_reestablish(reader, receipt)) {
+            return false;
+        }
+
+        // Keep the exact native identity material visible beside the retail security-map trace.
+        // `machine_wire` is the byte order the native raw-u64 reader consumed, which can be
+        // compared directly with retail "bdSecurityID" diagnostics without guessing endianness.
+        const auto machineBytes = raw_u64_bytes(receipt.machineId);
+        std::array<char, (sizeof(std::uint64_t) * 2) + 1> machineHex{};
+        std::array<char, (wire::kHostReestablishOpaque16Bytes * 2) + 1> opaque16Hex{};
+        std::array<char, (wire::kHostReestablishOpaque18Bytes * 2) + 1> opaque18Hex{};
+        format_hex(machineBytes, machineHex);
+        format_hex(receipt.opaque16, opaque16Hex);
+        format_hex(receipt.opaque18, opaque18Hex);
+        const std::uint64_t opaque16Lo = read_low_u64(receipt.opaque16);
+        const std::uint64_t opaque16Hi = read_low_u64(receipt.opaque16, 8);
+        const std::uint64_t opaque18Lo = read_low_u64(receipt.opaque18);
+        const std::uint64_t opaque18Hi = read_low_u64(receipt.opaque18, 8);
+        const unsigned opaque18Tail =
+            std::to_integer<unsigned>(receipt.opaque18[16])
+            | (std::to_integer<unsigned>(receipt.opaque18[17]) << 8U);
+        const unsigned method =
+            std::to_integer<unsigned>(receipt.address[descriptor::kNetAddrSize - 1]);
+
+        report(core::log::Level::info,
+               "ev=gameplay stage=migration_identity result=native_host_reestablish "
+               "session=0x%016llX machine=0x%016llX machine_wire=%s method=%u "
+               "opaque16=%s opaque16_lo=0x%016llX opaque16_hi=0x%016llX "
+               "opaque18=%s opaque18_lo=0x%016llX opaque18_hi=0x%016llX "
+               "opaque18_tail=0x%04X",
+               static_cast<unsigned long long>(receipt.sessionId),
+               static_cast<unsigned long long>(receipt.machineId),
+               machineHex.data(),
+               method,
+               opaque16Hex.data(),
+               static_cast<unsigned long long>(opaque16Lo),
+               static_cast<unsigned long long>(opaque16Hi),
+               opaque18Hex.data(),
+               static_cast<unsigned long long>(opaque18Lo),
+               static_cast<unsigned long long>(opaque18Hi),
+               opaque18Tail);
+
+        // Do not acknowledge the native host's reestablish until both sides can use the migrated
+        // security material. The server DTLS host already has a bounded migration-key registry;
+        // the client side uses Destiny's own learned bdSecurityKeyMap::registerKey path.
+        AcquireSRWLockExclusive(&g_admittedLock);
+        Admitted* completedRecord = nullptr;
+        for (Admitted& entry : g_admitted) {
+            if (entry.occupied && entry.sessionId == receipt.sessionId
+                && entry.migrationPhase == HostMigrationPhase::complete) {
+                completedRecord = &entry;
+                break;
+            }
+        }
+
+        // A completed replay is keyed by the accepted migration identity rather than the old UDP
+        // source endpoint. The owner-resecure can rebuild that endpoint before Destiny retransmits
+        // kind 22. Normal first acceptance still requires claim_owned() below.
+        const bool completedMigration = completedRecord != nullptr;
+        const bool replayAccepted =
+            completedMigration
+            && same_accepted_native_host(completedRecord->nativeHostAckReceipt, receipt);
+        Admitted replayRecord{};
+        if (replayAccepted) {
+            completedRecord->lastUse = g_admitClock.fetch_add(1) + 1;
+            replayRecord = *completedRecord;
+        }
+
+        Admitted* const initialRecord =
+            completedMigration ? nullptr : claim_owned(from, receipt.sessionId);
+        const HostMigrationPhase before =
+            completedMigration
+                ? HostMigrationPhase::complete
+                : (initialRecord != nullptr ? initialRecord->migrationPhase
+                                            : HostMigrationPhase::idle);
+        const bool expectedNativeEdge =
+            initialRecord != nullptr
+            && initialRecord->migrationPhase == HostMigrationPhase::awaitingNativeHostReestablish;
+        ReleaseSRWLockExclusive(&g_admittedLock);
+
+        // The first kind-25 can be queued on the channel that the intentional owner-resecure is
+        // about to tear down. Destiny then retransmits the same native kind-22 after the migrated
+        // channel secures. A completed migration must ACK that exact accepted identity again, but
+        // must not re-register either security map, invoke owner-resecure again, or reopen state.
+        if (completedMigration) {
+            if (replayAccepted) {
+                const bool replayQueued =
+                    publish_peer_reestablish(replayRecord, "ack_native_host_replay");
+                report(replayQueued ? core::log::Level::info : core::log::Level::debug,
+                       "ev=gameplay stage=migration result=native_host_reestablish_replay "
+                       "session=0x%016llX machine=0x%016llX phase=%s->%s advanced=0 ack=%s",
+                       static_cast<unsigned long long>(receipt.sessionId),
+                       static_cast<unsigned long long>(receipt.machineId),
+                       migration_phase_name(before),
+                       migration_phase_name(before),
+                       replayQueued ? "queued" : "deferred");
+            } else {
+                report(core::log::Level::warn,
+                       "ev=gameplay stage=migration result=native_host_reestablish_ignored "
+                       "reason=completed_identity_mismatch session=0x%016llX machine=0x%016llX "
+                       "phase=%s",
+                       static_cast<unsigned long long>(receipt.sessionId),
+                       static_cast<unsigned long long>(receipt.machineId),
+                       migration_phase_name(before));
+            }
+            return true;
+        }
+
+        sunrise::client::hooks::retail_log::NativeSecurityRegistrationResult nativeRegistration{};
+        if (expectedNativeEdge) {
+            dtls::register_security_key(
+                from,
+                receipt.machineId,
+                std::span<const std::byte>{receipt.opaque16.data(), receipt.opaque16.size()});
+            dtls::prefer_security_id(from, receipt.machineId);
+            nativeRegistration =
+                sunrise::client::hooks::retail_log::register_migrated_security_key(
+                    machineBytes, receipt.opaque16);
+            const bool nativeRegistered = nativeRegistration.invoked && nativeRegistration.inserted;
+            report(nativeRegistered ? core::log::Level::info : core::log::Level::warn,
+                   "ev=gameplay stage=migration_security result=%s session=0x%016llX "
+                   "security=0x%016llX native_ready=%u native_invoked=%u native_inserted=%u",
+                   nativeRegistered ? "registered" : "held",
+                   static_cast<unsigned long long>(receipt.sessionId),
+                   static_cast<unsigned long long>(receipt.machineId),
+                   nativeRegistration.ready ? 1U : 0U,
+                   nativeRegistration.invoked ? 1U : 0U,
+                   nativeRegistration.inserted ? 1U : 0U);
+        }
+
+        AcquireSRWLockExclusive(&g_admittedLock);
+        Admitted* const record = claim_owned(from, receipt.sessionId);
+        bool advanced = false;
+        if (record != nullptr
+            && record->migrationPhase == HostMigrationPhase::awaitingNativeHostReestablish
+            && nativeRegistration.invoked && nativeRegistration.inserted) {
+            // Retain only the identity material whose native registration succeeded. The phase
+            // does not become complete until service_migration() successfully queues kind 25, so
+            // this receipt cannot authorize replay before the first ACK commit boundary.
+            record->nativeHostAckReceipt.sessionId = receipt.sessionId;
+            record->nativeHostAckReceipt.machineId = receipt.machineId;
+            record->nativeHostAckReceipt.opaque16 = receipt.opaque16;
+            record->nativeHostAckReceipt.opaque18 = receipt.opaque18;
+            record->nativeHostAckReceipt.nativeSecurityRegistered = true;
+            // The receipt becomes replay-valid only when the first kind-25 is actually queued.
+            record->nativeHostAckReceipt.valid = false;
+            record->migrationPhase = HostMigrationPhase::peerReestablishReady;
+            record->migrationDue = now;
+            advanced = true;
+        }
+        const HostMigrationPhase after =
+            record != nullptr ? record->migrationPhase : HostMigrationPhase::idle;
+        ReleaseSRWLockExclusive(&g_admittedLock);
+
+        report(advanced ? core::log::Level::info : core::log::Level::debug,
+               "ev=gameplay stage=migration result=native_host_reestablish "
+               "session=0x%016llX machine=0x%016llX phase=%s->%s advanced=%u",
+               static_cast<unsigned long long>(receipt.sessionId),
+               static_cast<unsigned long long>(receipt.machineId),
+               migration_phase_name(before),
+               migration_phase_name(after),
+               advanced ? 1U : 0U);
+        return true;
+    }
+    if (id == static_cast<std::uint8_t>(wire::MigrationMessageId::peerReestablish)) {
+        std::uint64_t receiptSession = 0;
+        if (!wire::read_migration_session(reader, receiptSession)) {
+            return false;
+        }
+        AcquireSRWLockExclusive(&g_admittedLock);
+        Admitted* const record = claim_owned(from, receiptSession);
+        const HostMigrationPhase before =
+            record != nullptr ? record->migrationPhase : HostMigrationPhase::idle;
+        bool advanced = false;
+        if (record != nullptr
+            && record->migrationPhase == HostMigrationPhase::awaitingBaselineReestablish) {
+            record->migrationPhase = HostMigrationPhase::handoffToPeerReady;
+            record->migrationDue = now;
+            advanced = true;
+        }
+        const HostMigrationPhase after =
+            record != nullptr ? record->migrationPhase : HostMigrationPhase::idle;
+        ReleaseSRWLockExclusive(&g_admittedLock);
+        report(advanced ? core::log::Level::info : core::log::Level::debug,
+               "ev=gameplay stage=migration result=peer_reestablish session=0x%016llX "
+               "phase=%s->%s advanced=%u",
+               static_cast<unsigned long long>(receiptSession),
+               migration_phase_name(before),
+               migration_phase_name(after),
+               advanced ? 1U : 0U);
+        return true;
+    }
+    if (id == static_cast<std::uint8_t>(wire::MigrationMessageId::peerHandoff)) {
+        wire::HostHandoff receipt{};
+        if (!wire::read_host_handoff(reader, receipt)) {
+            return false;
+        }
+        AcquireSRWLockExclusive(&g_admittedLock);
+        Admitted* const record = claim_owned(from, receipt.sessionId);
+        const HostMigrationPhase before =
+            record != nullptr ? record->migrationPhase : HostMigrationPhase::idle;
+        bool advanced = false;
+        if (record != nullptr && record->migrationPhase == HostMigrationPhase::awaitingPeerHandoff
+            && receipt.successorIndex == kPeerMemberIndex) {
+            record->migrationPhase = HostMigrationPhase::transitionReady;
+            record->migrationDue = now;
+            advanced = true;
+        }
+        const HostMigrationPhase after =
+            record != nullptr ? record->migrationPhase : HostMigrationPhase::idle;
+        ReleaseSRWLockExclusive(&g_admittedLock);
+        report(advanced ? core::log::Level::info : core::log::Level::debug,
+               "ev=gameplay stage=migration result=peer_handoff session=0x%016llX successor=%u "
+               "phase=%s->%s advanced=%u",
+               static_cast<unsigned long long>(receipt.sessionId),
+               static_cast<unsigned>(receipt.successorIndex),
+               migration_phase_name(before),
+               migration_phase_name(after),
+               advanced ? 1U : 0U);
+        return true;
+    }
+    // Other migration/election bodies remain observation-only. The synchronization bodies above
+    // are consumed here because they drive this host's bounded migration sequence.
     return migration::consume(id, reader);
 }
 
@@ -746,18 +1354,44 @@ bool publish_membership(const state::gameplay::Endpoint& peer,
     Admitted* const record = claim(peer, sessionId);
     bool published = false;
     if (record != nullptr) {
-        // A retried join brings a new join id and drops any player the previous attempt added.
-        // It also starts again at `ready`, so the previous attempt's completion does not carry.
-        record->joinId = peerJoinId;
-        record->sessionId = sessionId;
-        record->hasPlayer = false;
-        record->playerId = 0;
-        record->joinComplete = false;
-        record->joinPublished = false;
-        record->activityHostPublished = false;
-        record->playerPublished = false;
-        record->lastRetry = 0;
-        published = publish_snapshot(*record);
+        const bool newTransaction = record->joinId != peerJoinId;
+        if (newTransaction) {
+            // Only a different join id starts a different admission transaction. The client
+            // retransmits the same join while waiting for initial updates; resetting state on
+            // those retries used to discard successful publications and migration state.
+            record->joinId = peerJoinId;
+            record->sessionId = sessionId;
+            record->hasPlayer = false;
+            record->playerId = 0;
+            record->initialMembershipPublished = false;
+            record->initialParametersPublished = false;
+            record->joinComplete = false;
+            record->joinPublished = false;
+            record->activityHostPublished = false;
+            record->playerPublished = false;
+            record->migrationPhase = HostMigrationPhase::idle;
+            record->nativeHostAckReceipt = {};
+            record->migrationDue = 0;
+            record->lastRetry = 0;
+        }
+        if (record->initialMembershipPublished) {
+            published = true;
+        } else {
+            published = publish_snapshot(*record);
+            record->initialMembershipPublished = published;
+            if (published) {
+                record->lastRetry = 0;
+            }
+        }
+        report(core::log::Level::debug,
+               "ev=gameplay stage=join_publication result=%s session=0x%016llX join=0x%016llX "
+               "transaction=%s membership=%u parameters=%u",
+               published ? "ready" : "deferred",
+               static_cast<unsigned long long>(sessionId),
+               static_cast<unsigned long long>(peerJoinId),
+               newTransaction ? "new" : "retry",
+               record->initialMembershipPublished ? 1U : 0U,
+               record->initialParametersPublished ? 1U : 0U);
     }
     ReleaseSRWLockExclusive(&g_admittedLock);
     return published;
@@ -787,26 +1421,42 @@ void service(std::uint64_t now) noexcept {
         *oldest = {};
     }
     for (Admitted& record : g_admitted) {
-        const bool owed =
-            record.occupied
-            && ((record.joinComplete && !record.joinPublished)
-                || (record.joinPublished && !record.activityHostPublished)
-                || (record.joinPublished && record.hasPlayer && !record.playerPublished));
-        if (!owed || now - record.lastRetry < kRetryInterval) {
+        if (!record.occupied) {
             continue;
         }
-        record.lastRetry = now;
-        if (!record.joinPublished) {
-            record.joinPublished = publish_snapshot(record);
+        const bool owed = !record.initialMembershipPublished
+                          || !record.initialParametersPublished
+                          || (record.joinComplete && !record.joinPublished)
+                          || (record.joinPublished && !record.activityHostPublished)
+                          || (record.joinPublished && record.hasPlayer && !record.playerPublished);
+        if (owed) {
+            if (now - record.lastRetry < kRetryInterval) {
+                continue;
+            }
+            record.lastRetry = now;
+            // Initial application establishment is ordered and independently retryable. A full
+            // queue must not turn a one-time join callback into a permanent missing update.
+            if (!record.initialMembershipPublished) {
+                record.initialMembershipPublished = publish_snapshot(record);
+                continue;
+            }
+            if (!record.initialParametersPublished) {
+                static_cast<void>(publish_initial_parameters(record));
+                continue;
+            }
+            if (!record.joinPublished) {
+                record.joinPublished = publish_snapshot(record);
+                continue;
+            }
+            if (!record.activityHostPublished) {
+                record.activityHostPublished = publish_activity_host(record);
+                continue;
+            }
+            // Last, so the join order is unchanged. Migration cannot arm until this succeeds.
+            record.playerPublished = publish_snapshot(record);
             continue;
         }
-        if (!record.activityHostPublished) {
-            record.activityHostPublished = publish_activity_host(record);
-            continue;
-        }
-        // Last, so the order the join needs is unchanged. The snapshot carries the player row the
-        // peer's own add asked for, and a refused one leaves the peer's player unnamed.
-        record.playerPublished = publish_snapshot(record);
+        service_migration(record, now);
     }
     ReleaseSRWLockExclusive(&g_admittedLock);
     // Outside the lock, in the order `release` already uses. The region's activity host stays: the
@@ -822,24 +1472,16 @@ void service(std::uint64_t now) noexcept {
 
 /** Publishes the parameter update a joining peer needs before it will finish its join. */
 bool publish_join_parameters(std::uint64_t sessionId) noexcept {
-    // A joining peer finishes only once it has applied one parameter update. Any update with a
-    // named parameter and no body sets that latch. This host has no values, so it releases a slot
-    // the peer never filled, which leaves the peer's state alone.
-    wire::ParameterUpdate update{};
-    update.sessionId = sessionId;
-    update.releasedMask = std::uint64_t{1} << kJoinLatchParameter;
-
-    const bool sent = send_reliable(
-        sessionId,
-        wire::kParameterUpdateId,
-        wire::kParameterUpdateSize,
-        [&update](bits::Writer& writer) { return wire::write_parameter_update(writer, update); });
-    std::array<char, kParameterNameCapacity> names{};
-    report(sent ? core::log::Level::info : core::log::Level::warn,
-           "ev=gameplay stage=parameters result=%s released=0x%08X names=%s",
-           sent ? "queued" : "fail",
-           static_cast<unsigned>(update.releasedMask),
-           wire::parameter_names(update.releasedMask, names.data(), names.size()));
+    AcquireSRWLockExclusive(&g_admittedLock);
+    Admitted* record = nullptr;
+    for (Admitted& entry : g_admitted) {
+        if (entry.occupied && entry.sessionId == sessionId) {
+            record = &entry;
+            break;
+        }
+    }
+    const bool sent = record != nullptr && publish_initial_parameters(*record);
+    ReleaseSRWLockExclusive(&g_admittedLock);
     return sent;
 }
 

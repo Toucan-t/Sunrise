@@ -1,9 +1,11 @@
-﻿#include "dtls_host.h"
+#include "dtls_host.h"
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <string_view>
 #include <type_traits>
 
 #include "../../../middleware/crypto/ecc_p224.h"
@@ -11,7 +13,6 @@
 #include "../../../middleware/gameplay/dtls/association_keys.h"
 #include "../../../middleware/gameplay/dtls/dtls_messages.h"
 #include "../../../middleware/gameplay/dtls/record.h"
-#include "../../../middleware/gameplay/dtls/replay_high_water.h"
 #include "../endpoint/gameplay_endpoint.h"
 #include "../gameplay_log.h"
 #include "../peer/peer_transport.h"
@@ -44,8 +45,6 @@ struct Association {
     std::array<std::byte, wire::kInitAckSize> issued{};
     /** Keys and tag every record of this association uses. */
     middleware::gameplay::dtls::RecordContext record{};
-    /** Authenticated record sequences already admitted on this association. */
-    middleware::gameplay::dtls::ReplayHighWater receiveHighWater{};
     /** False until one received record names the digest that authenticates it. */
     bool authKnown{};
     /** Sequence the next sent record carries. */
@@ -58,10 +57,21 @@ struct Association {
     std::uint64_t heard{};
 };
 
+/** Outbound association selected by the managed-session migration for one endpoint. */
+struct Preference {
+    state::gameplay::Endpoint endpoint{};
+    wire::SecurityId securityId{};
+    std::array<std::byte, middleware::gameplay::dtls::kSecurityKeySize> securityKey{};
+    bool occupied{};
+    bool keyPresent{};
+    bool preferred{};
+    bool reported{};
+};
+
 /** Stamps `opened` and `heard`. They only have to order associations, so neither is a clock. */
 std::uint64_t g_openClock{0};
 
-/** Join key the descriptor advertises. The derivation mixes it in. */
+/** Join key carried by the known-good direct-path descriptor. */
 constexpr std::array<std::byte, middleware::gameplay::dtls::kSecurityKeySize> kJoinKey{};
 
 /** Record arrivals reported per run. Enough to show the framing without a flood filling the log. */
@@ -72,11 +82,51 @@ constexpr std::uint8_t kRecordType = 6;
 std::atomic<unsigned> g_recordReported{0};
 
 std::array<Association, kAssociationCapacity> g_associations{};
+std::array<Preference, kAssociationCapacity> g_preferences{};
+
+/**
+ * Formats bytes as lowercase hex for one log line.
+ * @param input Bytes to render.
+ * @param output Receives the text and its terminator; it must hold two characters per byte.
+ */
+void to_hex(std::span<const std::byte> input, std::span<char> output) noexcept {
+    /** Digits one nibble maps to. */
+    constexpr std::string_view kDigits{"0123456789abcdef"};
+    /** Bits in one nibble. */
+    constexpr unsigned kNibbleBits = 4;
+    /** Mask of one nibble. */
+    constexpr unsigned kNibbleMask = 0xF;
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        const auto value = std::to_integer<unsigned>(input[index]);
+        output[index * 2] = kDigits[(value >> kNibbleBits) & kNibbleMask];
+        output[(index * 2) + 1] = kDigits[value & kNibbleMask];
+    }
+    output[input.size() * 2] = '\0';
+}
 
 /** @return True when both endpoints name the same address and port. */
 [[nodiscard]] bool same_endpoint(const state::gameplay::Endpoint& left,
                                  const state::gameplay::Endpoint& right) noexcept {
     return left.address == right.address && left.port == right.port;
+}
+
+/** Converts the scalar used by session messages to the opaque memory-order DTLS id. */
+[[nodiscard]] wire::SecurityId security_id(std::uint64_t value) noexcept {
+    wire::SecurityId output{};
+    for (std::size_t index = 0; index < output.size(); ++index) {
+        output[index] = static_cast<std::byte>((value >> (index * 8U)) & 0xFFU);
+    }
+    return output;
+}
+
+/** @return Preferred security association for an endpoint, or null. */
+[[nodiscard]] Preference* find_preference(const state::gameplay::Endpoint& endpoint) noexcept {
+    for (Preference& preference : g_preferences) {
+        if (preference.occupied && same_endpoint(preference.endpoint, endpoint)) {
+            return &preference;
+        }
+    }
+    return nullptr;
 }
 
 /**
@@ -137,10 +187,27 @@ std::array<Association, kAssociationCapacity> g_associations{};
  * @return The established association the peer last used, or null.
  */
 [[nodiscard]] Association* find_sending(const state::gameplay::Endpoint& to) noexcept {
+    Preference* const preference = find_preference(to);
     Association* chosen = nullptr;
     for (Association& association : g_associations) {
         if (association.stage != Stage::established || !same_endpoint(association.endpoint, to)) {
             continue;
+        }
+        // A native resecure can establish the migrated association before the peer has actually
+        // moved its gameplay channel onto it. Until one authenticated record arrives on that
+        // association, forcing replies there creates a split-brain channel: the peer writes on
+        // the old association while this host writes on the new one. Keep the normal
+        // "peer reads where it writes" rule until the preferred association proves it is live.
+        if (preference != nullptr && preference->preferred && association.heard != 0
+            && association.securityId == preference->securityId) {
+            if (!preference->reported) {
+                preference->reported = true;
+                report(core::log::Level::info,
+                       "ev=gameplay stage=dtls_preference result=selected endpoint=0x%08X:%u",
+                       to.address,
+                       static_cast<unsigned>(to.port));
+            }
+            return &association;
         }
         // Both stamps start at zero, so a fresh association wins only until a record arrives.
         if (chosen == nullptr || association.heard > chosen->heard
@@ -275,10 +342,15 @@ void on_cookie_echo(const state::gameplay::Endpoint& from,
         report(core::log::Level::warn, "ev=gameplay stage=dtls result=drop reason=key_agreement");
         return;
     }
-    const bool derived = middleware::gameplay::dtls::derive(
-        agreement.sharedSecret, kJoinKey, association->record.keys);
-    SecureZeroMemory(agreement.sharedSecret.data(), agreement.sharedSecret.size());
-    if (!derived) {
+    std::span<const std::byte> derivationKey{kJoinKey};
+    const Preference* const preference = find_preference(from);
+    const bool registeredKey = preference != nullptr && preference->keyPresent
+                               && preference->securityId == association->securityId;
+    if (registeredKey) {
+        derivationKey = preference->securityKey;
+    }
+    if (!middleware::gameplay::dtls::derive(
+            agreement.sharedSecret, derivationKey, association->record.keys)) {
         report(core::log::Level::warn, "ev=gameplay stage=dtls result=drop reason=key_derivation");
         return;
     }
@@ -298,10 +370,20 @@ void on_cookie_echo(const state::gameplay::Endpoint& from,
         ++g_openClock;
         association->opened = g_openClock;
     }
+    // TODO: stop logging key material once the digest choice is settled. Secrets must not be
+    // written to a log.
+    std::array<char, (2 * middleware::crypto::ecc::kFieldSize) + 1> secretText{};
+    to_hex(agreement.sharedSecret, secretText);
+    std::array<char, (2 * middleware::gameplay::dtls::kCypherKeySize) + 1> cypherText{};
+    to_hex(association->record.keys.cypher, cypherText);
     report(core::log::Level::info,
-           "ev=gameplay stage=dtls result=%s step=cookie_ack peer_tag=0x%04X",
+           "ev=gameplay stage=dtls result=%s step=cookie_ack peer_tag=0x%04X key=%s "
+           "secret=%s cypher=%s",
            sent ? "ok" : "send_failed",
-           static_cast<unsigned>(association->requesterTag));
+           static_cast<unsigned>(association->requesterTag),
+           registeredKey ? "registered" : "join",
+           secretText.data(),
+           cypherText.data());
 }
 
 /**
@@ -350,16 +432,6 @@ void on_record(const state::gameplay::Endpoint& from,
         }
         return;
     }
-    const wire::ReplayDecision replay = wire::update(association->receiveHighWater, sequence);
-    if (replay != wire::ReplayDecision::accepted) {
-        if (g_recordReported.fetch_add(1, std::memory_order_relaxed) < kMaxRecordReports) {
-            report(core::log::Level::warn,
-                   "ev=gameplay stage=dtls result=drop reason=%s seq=%u",
-                   replay == wire::ReplayDecision::duplicate ? "replay_duplicate" : "replay_old",
-                   sequence);
-        }
-        return;
-    }
     association->touched = now;
     ++g_openClock;
     association->heard = g_openClock;
@@ -392,6 +464,91 @@ bool send_payload(const state::gameplay::Endpoint& to,
     return endpoint::send_to(to, {datagram.data(), size});
 }
 
+/** Registers one migration security key without selecting its association yet. */
+void register_security_key(const state::gameplay::Endpoint& peer,
+                           std::uint64_t securityId,
+                           std::span<const std::byte> securityKey) noexcept {
+    if (securityId == 0
+        || securityKey.size() != middleware::gameplay::dtls::kSecurityKeySize) {
+        report(core::log::Level::warn,
+               "ev=gameplay stage=dtls_key result=rejected endpoint=0x%08X:%u "
+               "security=0x%016llX bytes=%zu",
+               peer.address,
+               static_cast<unsigned>(peer.port),
+               static_cast<unsigned long long>(securityId),
+               securityKey.size());
+        return;
+    }
+    Preference* target = find_preference(peer);
+    if (target == nullptr) {
+        for (Preference& candidate : g_preferences) {
+            if (!candidate.occupied) {
+                target = &candidate;
+                break;
+            }
+        }
+    }
+    if (target == nullptr) {
+        target = &g_preferences[0];
+    }
+    *target = {};
+    target->endpoint = peer;
+    target->securityId = security_id(securityId);
+    std::copy(securityKey.begin(), securityKey.end(), target->securityKey.begin());
+    target->occupied = true;
+    target->keyPresent = true;
+
+    // A speculative pre-activation handshake used the join key. Force the next retry to derive
+    // this association again with the now-known migration key.
+    for (Association& association : g_associations) {
+        if (association.stage != Stage::absent && same_endpoint(association.endpoint, peer)
+            && association.securityId == target->securityId) {
+            SecureZeroMemory(&association, sizeof(association));
+        }
+    }
+    report(core::log::Level::info,
+           "ev=gameplay stage=dtls_key result=registered endpoint=0x%08X:%u "
+           "security=0x%016llX",
+           peer.address,
+           static_cast<unsigned>(peer.port),
+           static_cast<unsigned long long>(securityId));
+}
+
+/** Selects the association the final host-reestablish descriptor asks the peer to commit. */
+void prefer_security_id(const state::gameplay::Endpoint& peer,
+                        std::uint64_t securityId) noexcept {
+    if (securityId == 0) {
+        return;
+    }
+    Preference* target = find_preference(peer);
+    if (target == nullptr) {
+        for (Preference& candidate : g_preferences) {
+            if (!candidate.occupied) {
+                target = &candidate;
+                break;
+            }
+        }
+    }
+    if (target == nullptr) {
+        target = &g_preferences[0];
+    }
+    const wire::SecurityId requested = security_id(securityId);
+    if (!target->occupied || target->securityId != requested) {
+        *target = {};
+        target->endpoint = peer;
+        target->securityId = requested;
+        target->occupied = true;
+    }
+    target->preferred = true;
+    target->reported = false;
+    report(core::log::Level::info,
+           "ev=gameplay stage=dtls_preference result=armed endpoint=0x%08X:%u "
+           "security=0x%016llX",
+           peer.address,
+           static_cast<unsigned>(peer.port),
+           static_cast<unsigned long long>(securityId));
+}
+
 /** Answers one association handshake datagram. */
 bool route(const state::gameplay::Endpoint& from,
            std::span<const std::byte> datagram,
@@ -420,6 +577,7 @@ void reset() noexcept {
     // An assignment can be elided, and the table holds derived keys.
     static_assert(std::is_trivially_copyable_v<Association>, "the table is erased as raw bytes");
     SecureZeroMemory(g_associations.data(), sizeof(g_associations));
+    SecureZeroMemory(g_preferences.data(), sizeof(g_preferences));
     g_openClock = 0;
 }
 
